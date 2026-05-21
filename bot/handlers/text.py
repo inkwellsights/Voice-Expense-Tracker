@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = get_settings(context)
-    if not is_authorised(update, settings):
+    if not is_authorised(update, context):
         return
 
     message = update.effective_message

@@ -69,16 +69,28 @@ The bot reply is a single message that morphs through stages — `🎧 Listening
 | `/categories` | List of valid categories. |
 | `/undo` | Delete your most recently logged entry. Never touches anyone else's. |
 
+### Admin commands
+
+Only users in `ADMIN_TELEGRAM_USER_IDS` (or the static `ALLOWED_TELEGRAM_USER_IDS` if no admins are set explicitly) can run these. They update the runtime allowlist (`data/bot/allowed_users.json`) and take effect immediately — no restart.
+
+| Command | What it does |
+|---|---|
+| `/allow <user_id>` | Add a Telegram user id to the allowlist. They can chat the bot from that moment. |
+| `/revoke <user_id>` | Remove a dynamically-added user. (Users from `.env` can only be removed by editing the file.) |
+| `/users` | Show the current allowlist — static vs dynamic. |
+
 ## Multi-user (one bot, one dashboard)
 
 ExpenseOwl is single-tenant by design, but the bot **tags every entry with the sender's name** (Telegram first name) so the same dashboard works for a household.
 
 1. Each user opens the bot's `@username` in Telegram and taps Start.
 2. They send their numeric Telegram id (from [@userinfobot](https://t.me/userinfobot)) to you.
-3. You add their id to `ALLOWED_TELEGRAM_USER_IDS=` in `.env` and `docker compose up -d --build bot`.
-4. They can now log expenses. On the dashboard, use the `Tags` filter to see one person's spend at a time.
+3. As admin, you DM the bot: `/allow <their_id>`. They can chat immediately, no restart needed.
+4. On the dashboard, use the `Tags` filter to see one person's spend at a time.
 
 If two users share a first name, override with `USER_TAGS=11111:Saif,22222:Aisha` in `.env`.
+
+For permanent allowlisting (e.g. yourself), set `ALLOWED_TELEGRAM_USER_IDS=...` in `.env` and rebuild — those entries can't be revoked from inside Telegram, only by editing `.env`.
 
 ## Architecture
 

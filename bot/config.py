@@ -37,6 +37,10 @@ class Settings:
     expenseowl_url: str
     currency_symbol: str
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
+    # Admin allowlist for /allow, /revoke, /users commands. If empty,
+    # falls back to allowed_user_ids (i.e. anyone in the static allowlist
+    # is also an admin). Set ADMIN_TELEGRAM_USER_IDS in .env to override.
+    admin_user_ids: frozenset[int] = field(default_factory=frozenset)
     user_tags: dict[int, str] = field(default_factory=dict)
     # If true, voice notes go straight to Gemini (audio-in, JSON out) — one
     # API call, no Whisper. Falls back to Whisper+Gemini-text on failure.
@@ -54,14 +58,13 @@ def _require(name: str) -> str:
     return value
 
 
-def _parse_user_ids() -> frozenset[int]:
-    """Read allowed user ids from ALLOWED_TELEGRAM_USER_IDS (plural, csv)
-    or the legacy ALLOWED_TELEGRAM_USER_ID (singular)."""
-    raw = (
-        os.getenv("ALLOWED_TELEGRAM_USER_IDS")
-        or os.getenv("ALLOWED_TELEGRAM_USER_ID")
-        or ""
-    ).strip()
+def _parse_user_id_csv(env_var: str, *legacy_names: str) -> frozenset[int]:
+    """Parse a CSV of Telegram user ids from an env var (or legacy fallbacks)."""
+    raw = os.getenv(env_var, "")
+    for legacy in legacy_names:
+        if not raw:
+            raw = os.getenv(legacy, "")
+    raw = raw.strip()
     if not raw:
         return frozenset()
     ids: set[int] = set()
@@ -73,9 +76,19 @@ def _parse_user_ids() -> frozenset[int]:
             ids.add(int(chunk))
         except ValueError:
             raise RuntimeError(
-                f"ALLOWED_TELEGRAM_USER_IDS contains a non-integer value: {chunk!r}"
+                f"{env_var} contains a non-integer value: {chunk!r}"
             )
     return frozenset(ids)
+
+
+def _parse_user_ids() -> frozenset[int]:
+    """Static allowlist from ALLOWED_TELEGRAM_USER_IDS (or legacy singular)."""
+    return _parse_user_id_csv("ALLOWED_TELEGRAM_USER_IDS", "ALLOWED_TELEGRAM_USER_ID")
+
+
+def _parse_admin_ids() -> frozenset[int]:
+    """Admin allowlist from ADMIN_TELEGRAM_USER_IDS. Empty = falls back to allowed."""
+    return _parse_user_id_csv("ADMIN_TELEGRAM_USER_IDS")
 
 
 def _parse_user_tags() -> dict[int, str]:
@@ -114,6 +127,7 @@ def load_settings() -> Settings:
         expenseowl_url=os.getenv("EXPENSEOWL_URL", "http://localhost:5006").rstrip("/"),
         currency_symbol=os.getenv("CURRENCY_SYMBOL", "৳"),
         allowed_user_ids=_parse_user_ids(),
+        admin_user_ids=_parse_admin_ids(),
         user_tags=_parse_user_tags(),
         use_audio_native_gemini=_parse_bool(
             os.getenv("USE_AUDIO_NATIVE_GEMINI"), default=True

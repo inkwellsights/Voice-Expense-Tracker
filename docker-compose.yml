@@ -28,6 +28,10 @@ services:
       # container port (8080), not the host-side mapping.
       - EXPENSEOWL_URL=http://expenseowl:8080
       - TZ=Asia/Dhaka
+    volumes:
+      # Holds the dynamic allowlist (data/bot/allowed_users.json) and any
+      # future stateful files the bot writes. Survives `up -d --build`.
+      - ./data/bot:/app/data
     networks:
       - tracker
 

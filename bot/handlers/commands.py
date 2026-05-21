@@ -14,8 +14,10 @@ from ..services.expenseowl import ExpenseOwlError, parse_expense_date
 from .common import (
     expense_has_tag,
     format_amount,
+    get_allowlist,
     get_owl,
     get_settings,
+    is_admin,
     is_authorised,
     user_tag,
 )
@@ -47,13 +49,13 @@ def _wants_all_view(context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorised(update, get_settings(context)):
+    if not is_authorised(update, context):
         return
     await update.effective_message.reply_markdown(WELCOME)
 
 
 async def cmd_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorised(update, get_settings(context)):
+    if not is_authorised(update, context):
         return
     listing = "\n".join(f"• {c}" for c in CATEGORIES)
     await update.effective_message.reply_text(f"Categories:\n{listing}")
@@ -96,7 +98,7 @@ def _owner_label(exp: dict[str, Any]) -> str:
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = get_settings(context)
-    if not is_authorised(update, settings):
+    if not is_authorised(update, context):
         return
     try:
         expenses = _filter_today(await _fetch_expenses(context))
@@ -139,7 +141,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = get_settings(context)
-    if not is_authorised(update, settings):
+    if not is_authorised(update, context):
         return
     try:
         expenses = _filter_month(await _fetch_expenses(context))
@@ -195,7 +197,7 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = get_settings(context)
-    if not is_authorised(update, settings):
+    if not is_authorised(update, context):
         return
 
     owl = get_owl(context)
@@ -254,3 +256,91 @@ async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"→ {target.get('category', 'Other')} ({target.get('name', '?')})"
     )
     await update.effective_message.reply_text(f"↩️ Removed: {summary}")
+
+
+# ---------------------------------------------------------------------------
+# Admin commands: /allow /revoke /users
+# Add or remove Telegram user ids from the bot's allowlist at runtime.
+# Only users in ADMIN_TELEGRAM_USER_IDS (or the static ALLOWED_TELEGRAM_USER_IDS
+# if that env is unset) can run these.
+# ---------------------------------------------------------------------------
+
+
+def _parse_id_arg(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    args = getattr(context, "args", None) or []
+    if not args:
+        return None
+    try:
+        return int(args[0].strip())
+    except ValueError:
+        return None
+
+
+async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not is_admin(update, context):
+        await msg.reply_text("⛔ Admin-only command.")
+        return
+    target = _parse_id_arg(context)
+    if target is None:
+        await msg.reply_markdown(
+            "Usage: `/allow <telegram_user_id>`\n"
+            "Get an id from @userinfobot."
+        )
+        return
+    allowlist = get_allowlist(context)
+    result = await allowlist.add(target)
+    if result == "added":
+        await msg.reply_text(f"✅ Added user {target} to allowlist.")
+    elif result == "already-static":
+        await msg.reply_text(f"User {target} is already in the static (.env) allowlist.")
+    elif result == "already-dynamic":
+        await msg.reply_text(f"User {target} is already allowed.")
+
+
+async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not is_admin(update, context):
+        await msg.reply_text("⛔ Admin-only command.")
+        return
+    target = _parse_id_arg(context)
+    if target is None:
+        await msg.reply_markdown("Usage: `/revoke <telegram_user_id>`")
+        return
+    allowlist = get_allowlist(context)
+    result = await allowlist.remove(target)
+    if result == "removed":
+        await msg.reply_text(f"↩️ Removed user {target} from allowlist.")
+    elif result == "static-cannot-remove":
+        await msg.reply_text(
+            f"User {target} is in the static (.env) allowlist. "
+            f"Edit .env and rebuild to remove."
+        )
+    elif result == "not-found":
+        await msg.reply_text(f"User {target} is not on the allowlist.")
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = update.effective_message
+    if not is_admin(update, context):
+        await msg.reply_text("⛔ Admin-only command.")
+        return
+    allowlist = get_allowlist(context)
+    static_ids = sorted(allowlist.static_ids())
+    dynamic_ids = sorted(allowlist.dynamic_ids())
+    if not static_ids and not dynamic_ids:
+        await msg.reply_text(
+            "⚠️ Allowlist is empty — bot is OPEN to anyone. "
+            "Add yourself with /allow before sharing."
+        )
+        return
+    lines = ["*Allowlist:*"]
+    if static_ids:
+        lines.append("\n_Static (from .env, cannot revoke at runtime):_")
+        for uid in static_ids:
+            lines.append(f"• `{uid}`")
+    if dynamic_ids:
+        lines.append("\n_Dynamic (added via /allow, can /revoke):_")
+        for uid in dynamic_ids:
+            lines.append(f"• `{uid}`")
+    await msg.reply_markdown("\n".join(lines))

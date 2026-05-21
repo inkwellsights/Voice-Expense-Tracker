@@ -14,7 +14,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot ./bot
 
 # Run as a non-root user; the bot only needs outbound network.
-RUN useradd --create-home --shell /bin/bash bot && chown -R bot:bot /app
+# Pre-create /app/data so the host-mounted volume inherits bot:bot ownership
+# (Docker preserves container-side perms when the target path already exists
+# inside the image at mount time).
+RUN useradd --create-home --shell /bin/bash bot \
+    && mkdir -p /app/data \
+    && chown -R bot:bot /app
 USER bot
 
 CMD ["python", "-m", "bot.main"]

@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from ..config import Settings
+from ..services.allowlist import Allowlist
 from ..services.expenseowl import ExpenseOwl, ExpenseOwlError
 
 logger = logging.getLogger(__name__)
@@ -21,16 +22,40 @@ def get_owl(context: ContextTypes.DEFAULT_TYPE) -> ExpenseOwl:
     return context.application.bot_data["owl"]
 
 
-def is_authorised(update: Update, settings: Settings) -> bool:
+def get_allowlist(context: ContextTypes.DEFAULT_TYPE) -> Allowlist:
+    return context.application.bot_data["allowlist"]
+
+
+def is_authorised(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Return True if the message sender is allowed to use the bot.
 
-    If no allowlist is configured, the bot is open to anyone (useful for
-    quick personal setups). Add ids to ALLOWED_TELEGRAM_USER_IDS to lock it down.
+    Consults the dynamic allowlist (env-static + runtime-dynamic via /allow).
+    If the combined allowlist is empty, the bot is open to anyone (useful
+    for first-run setup).
     """
-    if not settings.allowed_user_ids:
+    allowlist = get_allowlist(context)
+    if allowlist.is_open():
         return True
     user = update.effective_user
-    return bool(user and user.id in settings.allowed_user_ids)
+    return bool(user and user.id in allowlist)
+
+
+def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Return True if the sender can run /allow, /revoke, /users.
+
+    Admin set: ADMIN_TELEGRAM_USER_IDS if non-empty, otherwise the static
+    ALLOWED_TELEGRAM_USER_IDS (i.e. anyone in the env-listed allowlist).
+    Dynamically-added users (via /allow) are NEVER admins.
+    """
+    settings = get_settings(context)
+    admin_ids = settings.admin_user_ids or settings.allowed_user_ids
+    if not admin_ids:
+        # No admins configured at all → first /allow is from the open bot,
+        # caller is whoever sent the first message. Don't accidentally make
+        # everyone an admin; require explicit setup instead.
+        return False
+    user = update.effective_user
+    return bool(user and user.id in admin_ids)
 
 
 def user_tag(update: Update, settings: Settings) -> str:

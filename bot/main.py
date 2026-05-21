@@ -24,18 +24,28 @@ from telegram.ext import (
     filters,
 )
 
+from pathlib import Path
+
 from .config import load_settings
 from .handlers.commands import (
+    cmd_allow,
     cmd_categories,
     cmd_month,
+    cmd_revoke,
     cmd_start,
     cmd_today,
     cmd_undo,
+    cmd_users,
 )
 from .handlers.photo import handle_photo
 from .handlers.text import handle_text
 from .handlers.voice import handle_voice
+from .services.allowlist import Allowlist
 from .services.expenseowl import ExpenseOwl
+
+# Where the dynamic-allowlist JSON lives. Inside Docker we mount /app/data
+# from the host so the file survives `docker compose up -d --build bot`.
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +67,10 @@ def build_application() -> Application:
 
     application.bot_data["settings"] = settings
     application.bot_data["owl"] = ExpenseOwl(settings.expenseowl_url)
+    application.bot_data["allowlist"] = Allowlist(
+        static_ids=set(settings.allowed_user_ids),
+        json_path=DATA_DIR / "allowed_users.json",
+    )
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_start))
@@ -64,6 +78,10 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("month", cmd_month))
     application.add_handler(CommandHandler("categories", cmd_categories))
     application.add_handler(CommandHandler("undo", cmd_undo))
+    # Admin: manage allowlist at runtime
+    application.add_handler(CommandHandler("allow", cmd_allow))
+    application.add_handler(CommandHandler("revoke", cmd_revoke))
+    application.add_handler(CommandHandler("users", cmd_users))
 
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
