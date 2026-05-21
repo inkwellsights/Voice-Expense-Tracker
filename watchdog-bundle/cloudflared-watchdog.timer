@@ -1,0 +1,16 @@
+[Unit]
+Description=Run cloudflared-watchdog every 5 minutes
+Documentation=file:///etc/cloudflared-watchdog/watchdog.py
+
+[Timer]
+# Fire 1 minute after boot, then every 5 minutes thereafter
+OnBootSec=1min
+OnUnitActiveSec=5min
+# Tolerate a small jitter so we don't hammer the API at exactly :00 :05 :10 ...
+RandomizedDelaySec=20
+AccuracySec=10s
+Persistent=true
+Unit=cloudflared-watchdog.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,33 @@
+[Unit]
+Description=Cloudflare Tunnel ingress watchdog (auto-restores a watched hostname if dashboard wipes it)
+Documentation=file:///etc/cloudflared-watchdog/watchdog.py
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /etc/cloudflared-watchdog/watchdog.py
+User=root
+Group=root
+
+# Hardening — the script only needs outbound HTTPS + read of one token file + append to one log
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/log/cloudflared-watchdog.log
+ReadOnlyPaths=/etc/cloudflared-watchdog
+
+# Fail loudly in journal if it misbehaves
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

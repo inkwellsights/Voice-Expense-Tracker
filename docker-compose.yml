@@ -1,0 +1,36 @@
+services:
+  expenseowl:
+    image: tanq16/expenseowl:main
+    container_name: expenseowl
+    restart: unless-stopped
+    # ExpenseOwl serves on 8080 inside the container. We expose it on the host
+    # at 5006 to match the rest of this project's docs.
+    ports:
+      - "5006:8080"
+    volumes:
+      - ./data/expenseowl:/app/data
+    environment:
+      - TZ=Asia/Dhaka
+    networks:
+      - tracker
+
+  bot:
+    build: .
+    image: voice-expense-bot:latest
+    container_name: voice-expense-bot
+    restart: unless-stopped
+    depends_on:
+      - expenseowl
+    env_file:
+      - .env
+    environment:
+      # Inside the compose network the bot reaches ExpenseOwl on its real
+      # container port (8080), not the host-side mapping.
+      - EXPENSEOWL_URL=http://expenseowl:8080
+      - TZ=Asia/Dhaka
+    networks:
+      - tracker
+
+networks:
+  tracker:
+    driver: bridge
