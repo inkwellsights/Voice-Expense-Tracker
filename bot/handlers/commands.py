@@ -32,14 +32,54 @@ WELCOME = (
     "• Voice: \"lunch 350 and uber 280\" (English, Bangla, or both)\n"
     "• Text: `coffee 120, groceries 1500`\n"
     "• Photo: snap a receipt\n\n"
-    "Commands:\n"
-    "/today — your spend today (add `all` for everyone)\n"
-    "/month — your spend this month (add `all` for everyone)\n"
-    "/categories — available categories\n"
-    "/undo — delete your last logged expense\n\n"
-    "_Each entry is tagged with your name on the shared dashboard — "
-    "filter by your tag to see only your own spend._"
+    "Type /help to see every command and the dashboard link."
 )
+
+
+def _build_help_text(
+    dashboard_url: str,
+    *,
+    is_admin_viewer: bool,
+) -> str:
+    """Compose the /help message. Hides admin commands from non-admins."""
+    lines = [
+        "🤖 *Voice Expense Tracker — Help*",
+        "",
+        "Send me a *voice note*, *text*, or *photo of a receipt* and I'll log it.",
+        "Each entry is tagged with your name; filter by tag on the dashboard.",
+        "",
+    ]
+    if dashboard_url:
+        lines.append(f"📊 *Dashboard*: {dashboard_url}")
+        lines.append("")
+    lines.extend(
+        [
+            "*Examples:*",
+            "• Voice: _\"coffee 200 and uber 280\"_",
+            "• Voice (Banglish): _\"burger saare paach sho taka\"_",
+            "• Text: `lunch 350`",
+            "• Photo: snap a receipt",
+            "",
+            "*Commands:*",
+            "/start — quick welcome",
+            "/help — this message",
+            "/today — your spend today (`/today all` for everyone)",
+            "/month — your month by category (`/month all` for everyone)",
+            "/categories — list valid categories",
+            "/undo — delete your last logged entry",
+        ]
+    )
+    if is_admin_viewer:
+        lines.extend(
+            [
+                "",
+                "*Admin (you only):*",
+                "/allow `<user_id>` — add a Telegram user to the allowlist",
+                "/revoke `<user_id>` — remove a dynamically-added user",
+                "/users — show the current allowlist",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _wants_all_view(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -52,6 +92,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorised(update, context):
         return
     await update.effective_message.reply_markdown(WELCOME)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorised(update, context):
+        return
+    settings = get_settings(context)
+    text = _build_help_text(
+        settings.dashboard_url,
+        is_admin_viewer=is_admin(update, context),
+    )
+    await update.effective_message.reply_markdown(text)
 
 
 async def cmd_categories(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

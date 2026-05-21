@@ -30,6 +30,7 @@ from .config import load_settings
 from .handlers.commands import (
     cmd_allow,
     cmd_categories,
+    cmd_help,
     cmd_month,
     cmd_revoke,
     cmd_start,
@@ -73,7 +74,7 @@ def build_application() -> Application:
     )
 
     application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("help", cmd_start))
+    application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("month", cmd_month))
     application.add_handler(CommandHandler("categories", cmd_categories))

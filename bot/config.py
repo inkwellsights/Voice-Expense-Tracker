@@ -35,6 +35,10 @@ class Settings:
     groq_api_key: str
     gemini_api_key: str
     expenseowl_url: str
+    # User-facing dashboard URL shown in /help and welcome messages.
+    # Distinct from expenseowl_url which is the bot's internal API endpoint.
+    # Set DASHBOARD_URL in .env (e.g. https://expenses.example.com). Optional.
+    dashboard_url: str
     currency_symbol: str
     allowed_user_ids: frozenset[int] = field(default_factory=frozenset)
     # Admin allowlist for /allow, /revoke, /users commands. If empty,
@@ -125,6 +129,7 @@ def load_settings() -> Settings:
         groq_api_key=_require("GROQ_API_KEY"),
         gemini_api_key=_require("GEMINI_API_KEY"),
         expenseowl_url=os.getenv("EXPENSEOWL_URL", "http://localhost:5006").rstrip("/"),
+        dashboard_url=os.getenv("DASHBOARD_URL", "").strip().rstrip("/"),
         currency_symbol=os.getenv("CURRENCY_SYMBOL", "৳"),
         allowed_user_ids=_parse_user_ids(),
         admin_user_ids=_parse_admin_ids(),
