@@ -156,9 +156,13 @@ If you want different categories, edit `CATEGORIES` in `bot/config.py` AND updat
 
 For most personal/household use you'll never hit a cap. If you do, add a billing account on your Gemini key (new GCP users get $300 free credit) — paid pricing is ~$0.075 per million input tokens, roughly $0.01/month at personal scale.
 
+## Going local (optional, advanced)
+
+If you have an NVIDIA GPU box on your LAN/Tailscale, you can self-host Whisper there for free unlimited transcription + better privacy. See [`docs/LOCAL_WHISPER_SETUP.md`](docs/LOCAL_WHISPER_SETUP.md) for the full recipe (native Windows + faster-whisper + FastAPI, no Docker needed).
+
 ## Troubleshooting
 
-Read `RUNBOOK.md` — it's organised by failure mode, most likely first.
+Read [`RUNBOOK.md`](RUNBOOK.md) — it's organised by failure mode, most likely first.
 
 ## Resetting to a clean state
 
