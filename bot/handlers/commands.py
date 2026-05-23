@@ -1,13 +1,16 @@
 """Slash-command handlers."""
 from __future__ import annotations
 
+import csv
 import html
+import io
 import logging
 from collections import defaultdict
 from datetime import datetime
+from itertools import groupby
 from typing import Any
 
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.ext import ContextTypes
 
 from ..config import CATEGORIES, TIMEZONE
@@ -294,20 +297,131 @@ def _sum_buckets(entries: list[dict[str, Any]]) -> dict[str, float]:
     return out
 
 
-def _render_report_block(
+def _is_loan_entry(exp: dict[str, Any]) -> bool:
+    tags_lower = {str(t).strip().lower() for t in (exp.get("tags") or [])}
+    return "loan-taken" in tags_lower or "loan-repaid" in tags_lower
+
+
+def _entry_local_date(exp: dict[str, Any]):
+    when = parse_expense_date(exp.get("date"))
+    if not when:
+        return None
+    return when.astimezone(TIMEZONE).date()
+
+
+def _build_ledger_rows(
+    month_entries: list[dict[str, Any]],
+    all_entries: list[dict[str, Any]],
+    month_start_date,
+) -> list[dict[str, Any]]:
+    """Daily-total rows for regular activity + one row per loan event.
+
+    Running balance threads through every row, starting from the lifetime
+    balance just before `month_start_date` so the first row reflects where
+    you actually stood entering the month.
+    """
+    # Opening balance: cumulative net of every entry dated strictly before
+    # the start of the reported month. Loan-taken counts as +amount,
+    # loan-repaid as -amount, regular by sign — same as actual_balance math.
+    opening = 0.0
+    for e in all_entries:
+        d = _entry_local_date(e)
+        if d and d < month_start_date:
+            opening += float(e.get("amount") or 0)
+
+    sorted_month = sorted(
+        month_entries,
+        key=lambda e: parse_expense_date(e.get("date")) or datetime.min.replace(tzinfo=TIMEZONE),
+    )
+
+    rows: list[dict[str, Any]] = []
+    running = opening
+
+    # Opening-balance pseudo-row so the CSV is self-describing.
+    rows.append({
+        "date": month_start_date.strftime("%Y-%m-%d"),
+        "description": "(opening balance)",
+        "category": "",
+        "tags": "",
+        "in": "",
+        "out": "",
+        "balance": running,
+    })
+
+    for date_obj, group_iter in groupby(sorted_month, key=_entry_local_date):
+        if date_obj is None:
+            continue
+        group = list(group_iter)
+        regular = [e for e in group if not _is_loan_entry(e)]
+        loans = [e for e in group if _is_loan_entry(e)]
+
+        # Daily total for regular activity (skip if none — keeps CSV terse).
+        if regular:
+            reg_in = sum(float(e.get("amount") or 0) for e in regular if float(e.get("amount") or 0) > 0)
+            reg_out = sum(-float(e.get("amount") or 0) for e in regular if float(e.get("amount") or 0) < 0)
+            running += reg_in - reg_out
+            # Category column: list distinct categories that contributed,
+            # so the daily row still gives a hint of where the spend went.
+            cats = sorted({str(e.get("category") or "Other") for e in regular})
+            rows.append({
+                "date": date_obj.strftime("%Y-%m-%d"),
+                "description": f"Daily total ({len(regular)} entr{'y' if len(regular) == 1 else 'ies'})",
+                "category": ", ".join(cats),
+                "tags": "",
+                "in": reg_in if reg_in else "",
+                "out": reg_out if reg_out else "",
+                "balance": running,
+            })
+
+        for e in loans:
+            amt = float(e.get("amount") or 0)
+            in_ = abs(amt) if amt > 0 else 0.0
+            out_ = abs(amt) if amt < 0 else 0.0
+            running += in_ - out_
+            tags = e.get("tags") or []
+            rows.append({
+                "date": date_obj.strftime("%Y-%m-%d"),
+                "description": str(e.get("name") or "?"),
+                "category": str(e.get("category") or "Other"),
+                "tags": ", ".join(str(t) for t in tags),
+                "in": in_ if in_ else "",
+                "out": out_ if out_ else "",
+                "balance": running,
+            })
+
+    return rows
+
+
+def _ledger_to_csv_bytes(rows: list[dict[str, Any]]) -> bytes:
+    """Serialize ledger rows as UTF-8 CSV with a BOM (Excel reads ৳ correctly)."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Date", "Description", "Category", "Tags", "In", "Out", "Running balance"])
+    for r in rows:
+        writer.writerow([
+            r["date"],
+            r["description"],
+            r["category"],
+            r["tags"],
+            r["in"],
+            r["out"],
+            r["balance"],
+        ])
+    # ﻿ BOM helps Excel auto-detect UTF-8 and render Bangla / ৳ properly.
+    return ("﻿" + buf.getvalue()).encode("utf-8")
+
+
+def _build_summary_caption(
     month: dict[str, float],
     life: dict[str, float],
     currency: str,
     *,
     title: str,
 ) -> str:
-    """Return a fixed-width monospace report body (without <pre> wrappers)."""
+    """Short monospace summary used as the CSV attachment's caption."""
 
     def fmt(amount: float, signed: bool = False) -> str:
-        magnitude = abs(amount)
-        # format_amount handles currency + thousand-grouping; keep its
-        # output and prepend the sign for the signed-summary rows.
-        s = format_amount(magnitude, currency)
+        s = format_amount(abs(amount), currency)
         if signed:
             return ("+" if amount >= 0 else "−") + s
         return s
@@ -322,43 +436,31 @@ def _render_report_block(
         month["regular_income"] + month["loan_taken"]
         - month["regular_expense"] - month["loan_repaid"]
     )
-    spent_from_loan = min(life["regular_expense"], life["loan_taken"])
 
-    label_w, value_w = 22, 13
-    pad = " " * (label_w + 2)  # divider lines line up with the value column
+    label_w, value_w = 19, 12
 
     def row(label: str, value: str) -> str:
         return f"  {label.ljust(label_w)}{value.rjust(value_w)}"
 
     def div() -> str:
-        return pad + "─" * value_w
+        return " " * (label_w + 2) + "─" * value_w
 
-    lines: list[str] = [title, ""]
-    lines.append("THIS MONTH")
-    lines.append(row("Regular income", fmt(month["regular_income"])))
-    lines.append(row("Regular spend", fmt(month["regular_expense"])))
-    lines.append(row("Loans taken", fmt(month["loan_taken"])))
-    lines.append(row("Loans repaid", fmt(month["loan_repaid"])))
-    lines.append(div())
-    lines.append(row("Net this month", fmt(month_net, signed=True)))
-    lines.append("")
-    lines.append("LIFETIME")
-    lines.append(row("Total income", fmt(life["regular_income"])))
-    lines.append(row("Total spend", fmt(life["regular_expense"])))
-    lines.append(row("Loans taken", fmt(life["loan_taken"])))
-    lines.append(row("Loans repaid", fmt(life["loan_repaid"])))
-    lines.append(div())
-    lines.append(row("Current balance", fmt(actual_balance, signed=True)))
-    lines.append(row("Loans outstanding", fmt(outstanding)))
-    lines.append(div())
-    lines.append(row("Net worth", fmt(net_worth, signed=True)))
-    if life["loan_taken"] > 0:
-        lines.append(
-            row(
-                "Spent from loan",
-                f"{fmt(spent_from_loan)} / {fmt(life['loan_taken'])}",
-            )
-        )
+    lines = [
+        title,
+        "",
+        "THIS MONTH",
+        row("Regular in", fmt(month["regular_income"])),
+        row("Regular out", fmt(month["regular_expense"])),
+        row("Loans taken", fmt(month["loan_taken"])),
+        row("Loans repaid", fmt(month["loan_repaid"])),
+        div(),
+        row("Net", fmt(month_net, signed=True)),
+        "",
+        "LIFETIME LOANS",
+        row("Outstanding", fmt(outstanding)),
+        "",
+        row("Net worth", fmt(net_worth, signed=True)),
+    ]
     return "\n".join(lines)
 
 
@@ -384,20 +486,34 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text(f"Nothing logged {scope}.")
         return
 
-    month = _sum_buckets(_filter_month(own))
+    month_entries = _filter_month(own)
+    month = _sum_buckets(month_entries)
     life = _sum_buckets(own)
 
     now = datetime.now(TIMEZONE)
-    scope = "everyone" if show_all else tag
-    title = f"Report — {now.strftime('%B %Y')} · {scope}"
+    scope_name = "everyone" if show_all else tag
+    title = f"Report — {now.strftime('%B %Y')} · {scope_name}"
 
-    body = _render_report_block(
+    # Build CSV ledger; running balance opens with the lifetime balance
+    # as of the day BEFORE this month started (so each row reflects the
+    # ongoing account state, not just month-to-date deltas).
+    month_start = now.replace(day=1).date()
+    rows = _build_ledger_rows(month_entries, own, month_start)
+    csv_bytes = _ledger_to_csv_bytes(rows)
+
+    caption_body = _build_summary_caption(
         month, life, settings.currency_symbol, title=title
     )
-    # Telegram renders <pre> as a monospace block on mobile and desktop.
-    # Escape HTML chars first since the body can contain user-controlled
-    # tag strings (someone's first name might in theory have <, >, &).
-    await update.effective_message.reply_html(f"<pre>{html.escape(body)}</pre>")
+    caption = f"<pre>{html.escape(caption_body)}</pre>"
+
+    file_scope = "everyone" if show_all else tag.lower().replace(" ", "-")
+    filename = f"report-{now.strftime('%Y-%m')}-{file_scope}.csv"
+
+    await update.effective_message.reply_document(
+        document=InputFile(io.BytesIO(csv_bytes), filename=filename),
+        caption=caption,
+        parse_mode="HTML",
+    )
 
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
