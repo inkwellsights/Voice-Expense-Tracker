@@ -66,7 +66,8 @@ def _build_help_text(
             "/help — this message",
             "/today — your spend today (`/today all` for everyone)",
             "/month — your month by category (`/month all` for everyone)",
-            "/report — month + lifetime breakdown with loans + net worth",
+            "/report — daily ledger for the running month",
+            "/loan — per-loan tracker: taken, repaid, outstanding",
             "/categories — list valid categories",
             "/undo — delete your last logged entry",
         ]
@@ -361,6 +362,151 @@ def _daily_row(date_obj, entries: list[dict[str, Any]]) -> dict[str, Any]:
         "out": day_out,
         "in": day_in,
     }
+
+
+# ---------------------------------------------------------------------------
+# /loan — per-loan tracker.
+#
+# Reads each entry's tags to bucket it:
+#   • tag 'loan-taken'  → flow="taken"
+#   • tag 'loan-repaid' → flow="repaid"
+#   • tag 'loan:<slug>' → bucket key (else "" = unnamed bucket)
+#
+# Per loan, shows totals (taken / repaid / outstanding) and the last
+# few events. Loans are sorted by outstanding descending so anything
+# with money still owed surfaces first; settled loans drop to the
+# bottom. Caller-only by default; `/loan all` aggregates households.
+# ---------------------------------------------------------------------------
+
+_LOAN_NAME_TAG_PREFIX = "loan:"
+
+
+def _loan_name_from_tags(exp: dict[str, Any]) -> str:
+    for raw in (exp.get("tags") or []):
+        s = str(raw)
+        if s.startswith(_LOAN_NAME_TAG_PREFIX):
+            return s[len(_LOAN_NAME_TAG_PREFIX):]
+    return ""  # belongs to the unnamed bucket
+
+
+def _classify_loan_entry(exp: dict[str, Any]) -> tuple[str, str, float] | None:
+    """Return (flow, loan_name, magnitude) or None for non-loan entries."""
+    tags_lower = {str(t).strip().lower() for t in (exp.get("tags") or [])}
+    amt = float(exp.get("amount") or 0)
+    if "loan-taken" in tags_lower:
+        return "taken", _loan_name_from_tags(exp), abs(amt)
+    if "loan-repaid" in tags_lower:
+        return "repaid", _loan_name_from_tags(exp), abs(amt)
+    return None
+
+
+def _loan_display_name(slug: str) -> str:
+    if not slug:
+        return "(UNNAMED)"
+    # bike-loan → Bike Loan
+    return slug.replace("-", " ").upper()
+
+
+def _format_loan_amount(amount: float, currency: str) -> str:
+    if amount <= 0:
+        return "—"
+    return f"{currency}{int(round(amount)):,}"
+
+
+async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = get_settings(context)
+    if not is_authorised(update, context):
+        return
+    try:
+        all_expenses = await _fetch_expenses(context)
+    except ExpenseOwlError as exc:
+        await update.effective_message.reply_text(f"❌ {exc}")
+        return
+
+    show_all = _wants_all_view(context)
+    tag = user_tag(update, settings)
+    own = (
+        all_expenses if show_all
+        else [e for e in all_expenses if expense_has_tag(e, tag)]
+    )
+
+    buckets: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"taken": 0.0, "repaid": 0.0, "events": []}
+    )
+    for e in own:
+        cls = _classify_loan_entry(e)
+        if not cls:
+            continue
+        flow, name, magnitude = cls
+        b = buckets[name]
+        b[flow] += magnitude
+        b["events"].append((e, flow, magnitude))
+
+    cur = settings.currency_symbol
+    scope_name = "everyone" if show_all else tag
+
+    if not buckets:
+        prefix = "for everyone" if show_all else f"for {tag}"
+        await update.effective_message.reply_text(
+            f"No loans tracked {prefix} yet. "
+            f"Say something like \"borrowed 5000 from rahim\" to start tracking."
+        )
+        return
+
+    def sort_key(name: str) -> tuple[float, str]:
+        b = buckets[name]
+        outstanding = b["taken"] - b["repaid"]
+        # Active loans first (outstanding > 0), settled at bottom.
+        # Within active, descending by outstanding so the biggest debt is on top.
+        return (-outstanding, name)
+
+    sections: list[str] = [f"🏦 Loans · {scope_name}", ""]
+    total_outstanding = 0.0
+
+    for name in sorted(buckets.keys(), key=sort_key):
+        b = buckets[name]
+        outstanding = b["taken"] - b["repaid"]
+        total_outstanding += outstanding
+
+        header_status = (
+            "settled ✓" if outstanding <= 0
+            else f"{cur}{int(round(outstanding)):,} left"
+        )
+        sections.append(f"{_loan_display_name(name)}  ({header_status})")
+        sections.append(f"  Taken    {cur}{int(round(b['taken'])):,}")
+        sections.append(f"  Repaid   {cur}{int(round(b['repaid'])):,}")
+        sections.append(
+            f"  Out      {_format_loan_amount(outstanding, cur)}"
+        )
+
+        # Recent events, oldest first within the last-5 window so the
+        # ledger reads naturally top-to-bottom in chronological order.
+        events_by_date = sorted(
+            b["events"],
+            key=lambda x: parse_expense_date(x[0].get("date")) or datetime.min.replace(tzinfo=TIMEZONE),
+            reverse=True,
+        )[:5]
+        if events_by_date:
+            sections.append("  Recent:")
+            for e, flow, magnitude in reversed(events_by_date):
+                d = _entry_local_date(e)
+                date_str = d.strftime("%d/%m") if d else "?"
+                sign = "+" if flow == "taken" else "−"
+                desc = str(e.get("name") or "?")
+                if len(desc) > 18:
+                    desc = desc[:17] + "…"
+                sections.append(
+                    f"    {date_str}  {desc:<18} {sign}{int(round(magnitude)):,}"
+                )
+        sections.append("")
+
+    sections.append("─" * 36)
+    sections.append(
+        f"TOTAL OUTSTANDING: {cur}{int(round(total_outstanding)):,}"
+    )
+
+    body = "\n".join(sections).rstrip()
+    await update.effective_message.reply_html(f"<pre>{html.escape(body)}</pre>")
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

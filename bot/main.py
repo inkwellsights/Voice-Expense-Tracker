@@ -31,6 +31,7 @@ from .handlers.commands import (
     cmd_allow,
     cmd_categories,
     cmd_help,
+    cmd_loan,
     cmd_month,
     cmd_report,
     cmd_revoke,
@@ -87,6 +88,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("today", cmd_today))
     application.add_handler(CommandHandler("month", cmd_month))
     application.add_handler(CommandHandler("report", cmd_report))
+    application.add_handler(CommandHandler("loan", cmd_loan))
     application.add_handler(CommandHandler("categories", cmd_categories))
     application.add_handler(CommandHandler("undo", cmd_undo))
     # Admin: manage allowlist at runtime

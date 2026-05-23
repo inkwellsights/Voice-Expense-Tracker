@@ -75,17 +75,21 @@ Return ONLY a JSON array, no other text. Each entry MUST have:
    - LOAN_TAKEN signals: "borrowed", "took loan", "loan from", "ar dhaar nilam", "loan nilam", "dhaar ane", "loan paisi"
    - LOAN_REPAID signals: "paid back", "loan repayment", "loan emi", "settled loan", "loan dilam", "dhaar shod korlam", "loan shod"
    - Pair the flow with the right type: loan_taken → type "income"; loan_repaid → type "expense".
+- "loan_name": OPTIONAL — only when flow is loan_taken or loan_repaid. If the speaker mentions WHO the loan is from/to or WHAT the loan is for (a person's first name, "bike loan", "home loan", "office advance", "bro", "rahim"), extract a short lowercase identifier — one or two words, no spaces (use hyphens). Omit the field if the loan party isn't named.
 
 Loan examples:
 
 Input: "borrowed 5000 from rahim"
-Output: [{{"name":"loan from rahim","amount":5000,"category":"Other","type":"income","flow":"loan_taken"}}]
+Output: [{{"name":"loan from rahim","amount":5000,"category":"Other","type":"income","flow":"loan_taken","loan_name":"rahim"}}]
 
 Input: "paid back 1000 loan emi"
 Output: [{{"name":"loan emi","amount":1000,"category":"Bills","type":"expense","flow":"loan_repaid"}}]
 
 Input: "rahim ke 2000 loan shod korlam"
-Output: [{{"name":"loan repayment to rahim","amount":2000,"category":"Bills","type":"expense","flow":"loan_repaid"}}]
+Output: [{{"name":"loan repayment to rahim","amount":2000,"category":"Bills","type":"expense","flow":"loan_repaid","loan_name":"rahim"}}]
+
+Input: "bike loan emi 5000"
+Output: [{{"name":"bike loan emi","amount":5000,"category":"Bills","type":"expense","flow":"loan_repaid","loan_name":"bike"}}]
 
 Input: "dosh hajar loan nilam masnoonhub er jonno"
 Output: [{{"name":"loan for masnoonhub","amount":10000,"category":"Other","type":"income","flow":"loan_taken","context":"masnoonhub"}}]
@@ -248,6 +252,10 @@ def _validate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             kind = "income"
         elif flow_raw == "loan_repaid":
             kind = "expense"
+        # Loan name — only meaningful when flow != regular. Normalize to
+        # lowercase ascii-ish slug so two phrasings of the same name
+        # ("Rahim", "rahim ") collapse to one bucket.
+        loan_name = _normalize_loan_name(entry.get("loan_name")) if flow_raw != "regular" else ""
         cleaned.append(
             {
                 "name": name,
@@ -256,9 +264,29 @@ def _validate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "type": kind,
                 "context": context,
                 "flow": flow_raw,
+                "loan_name": loan_name,
             }
         )
     return cleaned
+
+
+_LOAN_NAME_KEEP = set("abcdefghijklmnopqrstuvwxyz0123456789-")
+
+
+def _normalize_loan_name(raw: Any) -> str:
+    """Slugify Gemini's loan_name field. Empty string if unusable."""
+    if raw is None:
+        return ""
+    s = str(raw).strip().lower()
+    if not s:
+        return ""
+    # Whitespace → single hyphen so multi-word names collapse cleanly.
+    s = "-".join(s.split())
+    # Drop anything outside the keep set so the value is safe to embed
+    # in a tag and to compare across entries.
+    s = "".join(c for c in s if c in _LOAN_NAME_KEEP)
+    s = s.strip("-")
+    return s
 
 
 # Retry transient errors so a single 503/429 doesn't force the user to re-send.

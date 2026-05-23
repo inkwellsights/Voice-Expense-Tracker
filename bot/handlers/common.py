@@ -115,16 +115,18 @@ def format_confirmation(
         kind = entry.get("type", "expense")
         amt = float(entry["amount"])
         # Suffix surfaces context tag (when non-default) and loan flow
-        # so the user can verify the bot understood. Stay terse.
+        # (with name when known) so the user can verify the bot
+        # understood. Stays terse.
         ctx = (entry.get("context") or "").strip()
         flow = (entry.get("flow") or "regular").strip().lower()
+        loan_name = (entry.get("loan_name") or "").strip()
         suffix_parts: list[str] = []
         if ctx and ctx != default_context:
             suffix_parts.append(ctx)
         if flow == "loan_taken":
-            suffix_parts.append("loan-taken")
+            suffix_parts.append(f"borrowed ({loan_name})" if loan_name else "borrowed")
         elif flow == "loan_repaid":
-            suffix_parts.append("loan-repaid")
+            suffix_parts.append(f"repaid ({loan_name})" if loan_name else "repaid")
         suffix = (" · " + " · ".join(suffix_parts)) if suffix_parts else ""
         if kind == "income":
             inc_total += amt
@@ -188,17 +190,23 @@ async def log_entries(
     logged: list[dict[str, Any]] = []
     last_id: str | None = None
     for entry in entries:
-        # Tag every entry with [<who>, <context>, <flow-marker>].
-        # Flow marker is only present when the entry is loan-related so the
-        # /report command (and the dashboard's tag dropdown) can separate
-        # loan flows from regular income/expense.
+        # Tag triplet (+ optional loan-name):
+        #   [<who>, <context>, <flow-marker?>, <loan:name?>]
+        # Flow marker only present for loan-flow entries; loan-name only
+        # present when Gemini extracted one. Both feed /loan's per-loan
+        # ledger and the dashboard's tag dropdown.
         flow = (entry.get("flow") or "regular").strip().lower()
         flow_tag = ""
         if flow == "loan_taken":
             flow_tag = "loan-taken"
         elif flow == "loan_repaid":
             flow_tag = "loan-repaid"
-        entry_tags = [t for t in (tag, entry.get("context") or "", flow_tag) if t]
+        loan_name = (entry.get("loan_name") or "").strip()
+        loan_name_tag = f"loan:{loan_name}" if (flow_tag and loan_name) else ""
+        entry_tags = [
+            t for t in (tag, entry.get("context") or "", flow_tag, loan_name_tag)
+            if t
+        ]
         try:
             created = await owl.create(
                 name=entry["name"],
