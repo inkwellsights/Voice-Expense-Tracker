@@ -6,6 +6,7 @@ Self-hosted, zero-cost personal expense tracker. Send a Telegram voice note, tex
 - **Brain**: [Gemini](https://aistudio.google.com) (audio-native multimodal — single API call) with a Whisper + Gemini-text fallback if the audio path fails
 - **Dashboard**: [ExpenseOwl](https://github.com/Tanq16/ExpenseOwl) in Docker — pie charts, table view, per-tag filtering
 - **Privacy option**: optional Cloudflare Tunnel + Access for public HTTPS dashboard with email-PIN login
+- **Personalized view**: optional filtering proxy so each Cloudflare-authenticated user sees only their own expenses on the same URL
 - **Resilience option**: optional watchdog that restores your tunnel route if Cloudflare's dashboard UI overwrites it
 - **Cost**: $0/mo on free tiers for personal use (Gemini ~1000-1500 req/day, Groq ~2000 req/day)
 
@@ -129,6 +130,31 @@ ExpenseOwl ships with no authentication. To expose the dashboard safely on the p
 
 **Important:** the Cloudflare dashboard's "Public Hostname" form saves the full ingress list and can silently drop entries when you add another hostname. To self-heal, see `watchdog-bundle/` — a systemd timer that auto-restores your route every 5 min via the Cloudflare API. Run `watchdog-bundle/install.sh` as root on the box.
 
+## Optional: Personalized dashboard view (per-user filter)
+
+ExpenseOwl is single-tenant, but if your tunnel is behind Cloudflare Access you can hand each authenticated user a personalized view at the same URL. The `expense-proxy` service sits between the tunnel and ExpenseOwl, reads the `Cf-Access-Authenticated-User-Email` header, and filters `GET /expenses` to only entries that carry that user's tag.
+
+```
+expenses.your-domain.com
+   → Cloudflare Tunnel
+     → expense-proxy:5007  (filters /expenses by tag from CF Access email)
+       → expenseowl:8080
+```
+
+Because both the pie chart on `/` and the table on `/table` aggregate client-side from `GET /expenses`, filtering that single endpoint personalizes the whole dashboard with no UI changes.
+
+To enable:
+
+1. Set `EMAIL_TO_TAG` in `.env`:
+   ```
+   EMAIL_TO_TAG=you@example.com:Saiful,partner@example.com:Aisha
+   ```
+   The tag must match what the bot writes (the user's Telegram first name, or the `USER_TAGS` override).
+2. `docker compose up -d --build proxy`
+3. Update your Cloudflare Tunnel ingress to point at `http://localhost:5007` instead of `5006`.
+
+`?all=1` on any URL disables filtering for that page load (household audit view). LAN access via `http://<host>:5006` continues to hit ExpenseOwl directly, unfiltered. See `expense-proxy/README.md` for full details.
+
 ## File layout
 
 ```
@@ -147,6 +173,7 @@ bot/
     expenseowl.py          # ExpenseOwl REST client
 docker-compose.yml         # both containers
 Dockerfile                 # bot image
+expense-proxy/             # optional filtering reverse proxy (per-user dashboard)
 scripts/flip_signs.py      # emergency tool: flip income/expense signs in bulk
 watchdog-bundle/           # Cloudflare Tunnel ingress watchdog (optional)
 RUNBOOK.md                 # ops runbook — read this when something breaks

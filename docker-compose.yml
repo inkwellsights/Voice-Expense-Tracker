@@ -35,6 +35,27 @@ services:
     networks:
       - tracker
 
+  # Filtering reverse proxy. Sits between Cloudflare Tunnel and ExpenseOwl
+  # so each authenticated user (CF Access email → tag map) sees only their
+  # own expenses at expenses.<your-domain>. LAN access via host:5006 still
+  # hits ExpenseOwl directly and remains unfiltered.
+  proxy:
+    build: ./expense-proxy
+    image: expense-proxy:latest
+    container_name: expense-proxy
+    restart: unless-stopped
+    depends_on:
+      - expenseowl
+    environment:
+      - EXPENSEOWL_URL=http://expenseowl:8080
+      - EMAIL_TO_TAG=${EMAIL_TO_TAG:-}
+      - TZ=Asia/Dhaka
+    ports:
+      # Published so the host-side cloudflared service can reach it.
+      - "5007:5007"
+    networks:
+      - tracker
+
 networks:
   tracker:
     driver: bridge
