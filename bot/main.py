@@ -43,6 +43,7 @@ from .handlers.text import handle_text
 from .handlers.voice import handle_voice
 from .services.allowlist import Allowlist
 from .services.expenseowl import ExpenseOwl
+from .services import parser as parser_service
 
 # Where the dynamic-allowlist JSON lives. Inside Docker we mount /app/data
 # from the host so the file survives `docker compose up -d --build bot`.
@@ -64,6 +65,13 @@ def build_application() -> Application:
         ApplicationBuilder()
         .token(settings.telegram_bot_token)
         .build()
+    )
+
+    # Wire context-tag config into the module-level parser cache so
+    # every parse_* call gets the right system prompt addendum + synonym
+    # normalization. Done once at startup; safe to call again on reload.
+    parser_service.configure_context(
+        settings.context_synonyms, settings.context_default
     )
 
     application.bot_data["settings"] = settings

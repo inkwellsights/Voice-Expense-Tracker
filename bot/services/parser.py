@@ -2,6 +2,11 @@
 
 Handles both plain text and receipt images. Free tier: 15 RPM / 1M tokens per day.
 Input may be Bengali, English, or Banglish — extract the numeric amount regardless.
+
+Context tags: each entry also carries a 'context' (e.g. 'personal',
+'MHUBEXP') derived from what the speaker mentions. The synonym table
+is configured via TAG_SYNONYMS in .env; parser.configure_context()
+sets the module-level defaults at startup.
 """
 from __future__ import annotations
 
@@ -14,6 +19,12 @@ from typing import Any
 import httpx
 
 from ..config import CATEGORIES
+
+# Set at startup by main.py via configure_context(...). Defaults below
+# keep tests / imports working with no env configuration.
+_CONTEXT_SYNONYMS: dict[str, list[str]] = {}
+_CONTEXT_DEFAULT: str = "personal"
+_CONTEXT_BLOCK: str = ""
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +70,7 @@ Return ONLY a JSON array, no other text. Each entry MUST have:
 - "amount": positive integer, no currency symbols, no decimals unless explicit
 - "category": one of {CATEGORIES}
 - "type": "expense" or "income"
+- "context": short lowercase bucket the money belongs to. If the speaker mentions a specific company, project, person, fund, or label, extract it as a short lowercase string (e.g. "masnoonhub", "wedding fund", "office"). Otherwise omit the field — the bot will default it.
 
 Examples:
 
@@ -127,6 +139,65 @@ def _extract_json_array(raw: str) -> list[dict[str, Any]]:
     return parsed
 
 
+def configure_context(synonyms: dict[str, list[str]], default: str) -> None:
+    """Wire context-tag config into the parser at startup.
+
+    Called once from main.py with values from Settings. After this call,
+    _validate() will normalize each entry's `context` field against the
+    synonym table, and the system prompt will include a hint block listing
+    the canonical names + their accepted variations.
+    """
+    global _CONTEXT_SYNONYMS, _CONTEXT_DEFAULT, _CONTEXT_BLOCK
+    _CONTEXT_SYNONYMS = synonyms or {}
+    _CONTEXT_DEFAULT = (default or "personal").strip() or "personal"
+    _CONTEXT_BLOCK = _build_context_block(_CONTEXT_SYNONYMS, _CONTEXT_DEFAULT)
+    logger.info(
+        "Context tags configured: canonicals=%s default=%s",
+        list(_CONTEXT_SYNONYMS.keys()) or "(none)",
+        _CONTEXT_DEFAULT,
+    )
+
+
+def _build_context_block(synonyms: dict[str, list[str]], default: str) -> str:
+    """System-prompt addendum that teaches Gemini the canonical context list."""
+    if not synonyms:
+        return ""
+    lines = [
+        "CONTEXT NORMALIZATION:",
+        "If the speaker mentions any of these terms, use the canonical name "
+        "as the entry's `context` field. The bot will collapse synonyms to "
+        "the canonical anyway, so don't overthink it — just be specific.",
+    ]
+    for canon, syns in synonyms.items():
+        lines.append(f'  - "{canon}" ← if you hear any of: {", ".join(syns)}')
+    lines.append(f'If no specific context is mentioned, default to "{default}".')
+    return "\n".join(lines)
+
+
+def _normalize_context(raw: Any, synonyms: dict[str, list[str]], default: str) -> str:
+    """Map a free-form `context` value to one of the canonical names."""
+    if raw is None:
+        return default
+    needle = str(raw).strip().lower()
+    if not needle:
+        return default
+    # Exact canonical match first
+    for canon in synonyms:
+        if canon.lower() == needle:
+            return canon
+    # Synonym exact match
+    for canon, syns in synonyms.items():
+        if needle in syns:
+            return canon
+    # Loose: needle contains a known synonym (helps when Gemini emits
+    # "masnoonhub express" with a space, or qualifies with "for")
+    for canon, syns in synonyms.items():
+        for syn in syns:
+            if len(syn) >= 4 and syn in needle:
+                return canon
+    return default
+
+
 def _validate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     cleaned: list[dict[str, Any]] = []
     for entry in entries:
@@ -146,8 +217,17 @@ def _validate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         if category not in CATEGORIES:
             category = "Other"
+        context = _normalize_context(
+            entry.get("context"), _CONTEXT_SYNONYMS, _CONTEXT_DEFAULT
+        )
         cleaned.append(
-            {"name": name, "amount": amount, "category": category, "type": kind}
+            {
+                "name": name,
+                "amount": amount,
+                "category": category,
+                "type": kind,
+                "context": context,
+            }
         )
     return cleaned
 
@@ -170,8 +250,11 @@ async def _call_gemini(parts: list[dict[str, Any]], *, api_key: str) -> str:
     """
     import asyncio  # local import keeps top of file untouched
 
+    prompt = SYSTEM_PROMPT
+    if _CONTEXT_BLOCK:
+        prompt = prompt + "\n\n" + _CONTEXT_BLOCK
     body = {
-        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "systemInstruction": {"parts": [{"text": prompt}]},
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "temperature": 0.1,

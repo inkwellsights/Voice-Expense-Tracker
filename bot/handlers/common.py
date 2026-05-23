@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from ..config import Settings
+from ..config import TIMEZONE, Settings
 from ..services.allowlist import Allowlist
 from ..services.expenseowl import ExpenseOwl, ExpenseOwlError
 
@@ -97,24 +98,38 @@ def format_amount(amount: float, currency: str) -> str:
     return f"{currency}{magnitude:,.2f}"
 
 
-def format_confirmation(entries: list[dict[str, Any]], currency: str) -> str:
-    lines = ["✅ Logged:"]
+def format_confirmation(
+    entries: list[dict[str, Any]],
+    currency: str,
+    *,
+    default_context: str = "personal",
+) -> str:
+    # Bot logs everything in real-time, so a single header date+time applies
+    # to the whole batch. Asia/Dhaka local time, matches the timestamps the
+    # entries get stored with.
+    stamp = datetime.now(TIMEZONE).strftime("%Y-%m-%d · %H:%M")
+    lines = [f"✅ Logged · {stamp}"]
     exp_total = 0.0
     inc_total = 0.0
     for entry in entries:
         kind = entry.get("type", "expense")
         amt = float(entry["amount"])
+        # Only surface the context tag when it's not the default — keeps
+        # "personal" entries visually clean and makes overrides (MHUBEXP,
+        # etc.) stand out at a glance.
+        ctx = (entry.get("context") or "").strip()
+        ctx_suffix = f" · {ctx}" if ctx and ctx != default_context else ""
         if kind == "income":
             inc_total += amt
             lines.append(
                 f"• +{format_amount(amt, currency)} → {entry['category']} "
-                f"({entry['name']}) 💰"
+                f"({entry['name']}){ctx_suffix} 💰"
             )
         else:
             exp_total += amt
             lines.append(
                 f"• {format_amount(amt, currency)} → {entry['category']} "
-                f"({entry['name']})"
+                f"({entry['name']}){ctx_suffix}"
             )
     if len(entries) > 1 or (exp_total and inc_total):
         if inc_total:
@@ -166,12 +181,15 @@ async def log_entries(
     logged: list[dict[str, Any]] = []
     last_id: str | None = None
     for entry in entries:
+        # Tag every entry with [<who>, <context>]. Skip empties so a
+        # missing context (legacy entries) doesn't write a "" tag.
+        entry_tags = [t for t in (tag, entry.get("context") or "") if t]
         try:
             created = await owl.create(
                 name=entry["name"],
                 amount=entry["amount"],
                 category=entry["category"],
-                tags=[tag],
+                tags=entry_tags,
                 kind=entry.get("type", "expense"),
             )
         except ExpenseOwlError as exc:
@@ -185,4 +203,10 @@ async def log_entries(
         last_map = context.application.bot_data.setdefault("last_expense_id", {})
         last_map[user_id] = last_id
 
-    await respond(format_confirmation(logged, settings.currency_symbol))
+    await respond(
+        format_confirmation(
+            logged,
+            settings.currency_symbol,
+            default_context=settings.context_default,
+        )
+    )

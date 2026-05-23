@@ -50,6 +50,15 @@ class Settings:
     # API call, no Whisper. Falls back to Whisper+Gemini-text on failure.
     # Flip to false in .env to revert to the Whisper-first pipeline.
     use_audio_native_gemini: bool = True
+    # Second tag attached to every logged entry alongside the user tag.
+    # Canonical name when nothing specific is mentioned in the input
+    # (e.g. "personal").
+    context_default: str = "personal"
+    # Canonical-context-name → list of accepted synonyms (lower-cased,
+    # canonical name itself included). Lets Gemini hear sloppy variations
+    # ("masnoonhub", "mhubexpress", "masnoon hub express") and the bot
+    # collapse all of them to one canonical tag ("MHUBEXP").
+    context_synonyms: dict[str, list[str]] = field(default_factory=dict)
 
 
 def _require(name: str) -> str:
@@ -123,6 +132,39 @@ def _parse_bool(raw: str | None, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _parse_context_synonyms() -> dict[str, list[str]]:
+    """Parse TAG_SYNONYMS into {canonical: [synonym1, synonym2, ...]}.
+
+    Format: TAG_SYNONYMS=MHUBEXP:masnoonhubexpress|mhubexpress|masnoonhub,family:familyfund|family fund
+    The canonical name itself is implicitly included in its own synonym list
+    (lowercased) so Gemini can return either form and we normalize correctly.
+    """
+    raw = os.getenv("TAG_SYNONYMS", "").strip()
+    if not raw:
+        return {}
+    out: dict[str, list[str]] = {}
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        canon, syns_part = chunk.split(":", 1)
+        canon = canon.strip()
+        if not canon:
+            continue
+        syns = [s.strip().lower() for s in syns_part.split("|") if s.strip()]
+        if canon.lower() not in syns:
+            syns.append(canon.lower())
+        # De-dup while preserving order
+        seen: set[str] = set()
+        unique: list[str] = []
+        for s in syns:
+            if s not in seen:
+                unique.append(s)
+                seen.add(s)
+        out[canon] = unique
+    return out
+
+
 def load_settings() -> Settings:
     return Settings(
         telegram_bot_token=_require("TELEGRAM_BOT_TOKEN"),
@@ -137,4 +179,6 @@ def load_settings() -> Settings:
         use_audio_native_gemini=_parse_bool(
             os.getenv("USE_AUDIO_NATIVE_GEMINI"), default=True
         ),
+        context_default=(os.getenv("TAG_DEFAULT", "personal").strip() or "personal"),
+        context_synonyms=_parse_context_synonyms(),
     )
