@@ -12,9 +12,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 
-RUN useradd --create-home --shell /bin/bash proxy \
-    && chown -R proxy:proxy /app
-USER proxy
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 5007
 
