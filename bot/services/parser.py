@@ -71,6 +71,24 @@ Return ONLY a JSON array, no other text. Each entry MUST have:
 - "category": one of {CATEGORIES}
 - "type": "expense" or "income"
 - "context": short lowercase bucket the money belongs to. If the speaker mentions a specific company, project, person, fund, or label, extract it as a short lowercase string (e.g. "masnoonhub", "wedding fund", "office"). Otherwise omit the field — the bot will default it.
+- "flow": "regular" (default), "loan_taken" (money came in as a loan), or "loan_repaid" (money paid back to settle a loan).
+   - LOAN_TAKEN signals: "borrowed", "took loan", "loan from", "ar dhaar nilam", "loan nilam", "dhaar ane", "loan paisi"
+   - LOAN_REPAID signals: "paid back", "loan repayment", "loan emi", "settled loan", "loan dilam", "dhaar shod korlam", "loan shod"
+   - Pair the flow with the right type: loan_taken → type "income"; loan_repaid → type "expense".
+
+Loan examples:
+
+Input: "borrowed 5000 from rahim"
+Output: [{{"name":"loan from rahim","amount":5000,"category":"Other","type":"income","flow":"loan_taken"}}]
+
+Input: "paid back 1000 loan emi"
+Output: [{{"name":"loan emi","amount":1000,"category":"Bills","type":"expense","flow":"loan_repaid"}}]
+
+Input: "rahim ke 2000 loan shod korlam"
+Output: [{{"name":"loan repayment to rahim","amount":2000,"category":"Bills","type":"expense","flow":"loan_repaid"}}]
+
+Input: "dosh hajar loan nilam masnoonhub er jonno"
+Output: [{{"name":"loan for masnoonhub","amount":10000,"category":"Other","type":"income","flow":"loan_taken","context":"masnoonhub"}}]
 
 Examples:
 
@@ -220,6 +238,16 @@ def _validate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         context = _normalize_context(
             entry.get("context"), _CONTEXT_SYNONYMS, _CONTEXT_DEFAULT
         )
+        flow_raw = str(entry.get("flow") or "regular").strip().lower()
+        if flow_raw not in ("regular", "loan_taken", "loan_repaid"):
+            flow_raw = "regular"
+        # Coerce type to match flow — loan_taken is always income,
+        # loan_repaid is always expense. Protects against Gemini emitting
+        # an inconsistent pair.
+        if flow_raw == "loan_taken":
+            kind = "income"
+        elif flow_raw == "loan_repaid":
+            kind = "expense"
         cleaned.append(
             {
                 "name": name,
@@ -227,6 +255,7 @@ def _validate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "category": category,
                 "type": kind,
                 "context": context,
+                "flow": flow_raw,
             }
         )
     return cleaned

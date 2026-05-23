@@ -1,6 +1,7 @@
 """Slash-command handlers."""
 from __future__ import annotations
 
+import html
 import logging
 from collections import defaultdict
 from datetime import datetime
@@ -65,6 +66,7 @@ def _build_help_text(
             "/help — this message",
             "/today — your spend today (`/today all` for everyone)",
             "/month — your month by category (`/month all` for everyone)",
+            "/report — month + lifetime breakdown with loans + net worth",
             "/categories — list valid categories",
             "/undo — delete your last logged entry",
         ]
@@ -244,6 +246,158 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not show_all:
         lines.append("_Tip: send `/month all` for the shared view._")
     await update.effective_message.reply_markdown("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# /report — month + lifetime financial breakdown for the caller, with
+# loans modelled as a separate funding pool.
+#
+# Entry classification (uses tags written by common.log_entries):
+#   • "loan-taken"  tag  → loan_taken bucket (type=income)
+#   • "loan-repaid" tag  → loan_repaid bucket (type=expense)
+#   • otherwise sign of amount decides regular_income vs regular_expense
+#
+# Derived numbers:
+#   outstanding_loan = lifetime loan_taken − lifetime loan_repaid
+#   actual_balance   = lifetime (regular_income + loan_taken)
+#                      − lifetime (regular_expense + loan_repaid)
+#   net_worth        = actual_balance − outstanding_loan
+#                      (≡ lifetime regular_income − regular_expense)
+#   spent_from_loan  = min(lifetime regular_expense, lifetime loan_taken)
+#                      — sub-budget interpretation: regular spend is
+#                        considered loan-funded until the loan is exhausted.
+# ---------------------------------------------------------------------------
+
+_REPORT_BUCKETS = ("regular_income", "regular_expense", "loan_taken", "loan_repaid")
+
+
+def _classify_entry(exp: dict[str, Any]) -> tuple[str, float]:
+    tags_lower = {str(t).strip().lower() for t in (exp.get("tags") or [])}
+    amt = float(exp.get("amount") or 0)
+    if "loan-taken" in tags_lower:
+        return "loan_taken", abs(amt)
+    if "loan-repaid" in tags_lower:
+        return "loan_repaid", abs(amt)
+    if amt > 0:
+        return "regular_income", amt
+    if amt < 0:
+        return "regular_expense", abs(amt)
+    return "skip", 0.0
+
+
+def _sum_buckets(entries: list[dict[str, Any]]) -> dict[str, float]:
+    out = {b: 0.0 for b in _REPORT_BUCKETS}
+    for exp in entries:
+        bucket, magnitude = _classify_entry(exp)
+        if bucket in out:
+            out[bucket] += magnitude
+    return out
+
+
+def _render_report_block(
+    month: dict[str, float],
+    life: dict[str, float],
+    currency: str,
+    *,
+    title: str,
+) -> str:
+    """Return a fixed-width monospace report body (without <pre> wrappers)."""
+
+    def fmt(amount: float, signed: bool = False) -> str:
+        magnitude = abs(amount)
+        # format_amount handles currency + thousand-grouping; keep its
+        # output and prepend the sign for the signed-summary rows.
+        s = format_amount(magnitude, currency)
+        if signed:
+            return ("+" if amount >= 0 else "−") + s
+        return s
+
+    outstanding = life["loan_taken"] - life["loan_repaid"]
+    actual_balance = (
+        life["regular_income"] + life["loan_taken"]
+        - life["regular_expense"] - life["loan_repaid"]
+    )
+    net_worth = actual_balance - outstanding
+    month_net = (
+        month["regular_income"] + month["loan_taken"]
+        - month["regular_expense"] - month["loan_repaid"]
+    )
+    spent_from_loan = min(life["regular_expense"], life["loan_taken"])
+
+    label_w, value_w = 22, 13
+    pad = " " * (label_w + 2)  # divider lines line up with the value column
+
+    def row(label: str, value: str) -> str:
+        return f"  {label.ljust(label_w)}{value.rjust(value_w)}"
+
+    def div() -> str:
+        return pad + "─" * value_w
+
+    lines: list[str] = [title, ""]
+    lines.append("THIS MONTH")
+    lines.append(row("Regular income", fmt(month["regular_income"])))
+    lines.append(row("Regular spend", fmt(month["regular_expense"])))
+    lines.append(row("Loans taken", fmt(month["loan_taken"])))
+    lines.append(row("Loans repaid", fmt(month["loan_repaid"])))
+    lines.append(div())
+    lines.append(row("Net this month", fmt(month_net, signed=True)))
+    lines.append("")
+    lines.append("LIFETIME")
+    lines.append(row("Total income", fmt(life["regular_income"])))
+    lines.append(row("Total spend", fmt(life["regular_expense"])))
+    lines.append(row("Loans taken", fmt(life["loan_taken"])))
+    lines.append(row("Loans repaid", fmt(life["loan_repaid"])))
+    lines.append(div())
+    lines.append(row("Current balance", fmt(actual_balance, signed=True)))
+    lines.append(row("Loans outstanding", fmt(outstanding)))
+    lines.append(div())
+    lines.append(row("Net worth", fmt(net_worth, signed=True)))
+    if life["loan_taken"] > 0:
+        lines.append(
+            row(
+                "Spent from loan",
+                f"{fmt(spent_from_loan)} / {fmt(life['loan_taken'])}",
+            )
+        )
+    return "\n".join(lines)
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = get_settings(context)
+    if not is_authorised(update, context):
+        return
+    try:
+        all_expenses = await _fetch_expenses(context)
+    except ExpenseOwlError as exc:
+        await update.effective_message.reply_text(f"❌ {exc}")
+        return
+
+    show_all = _wants_all_view(context)
+    tag = user_tag(update, settings)
+    own = (
+        all_expenses if show_all
+        else [e for e in all_expenses if expense_has_tag(e, tag)]
+    )
+
+    if not own:
+        scope = "yet" if show_all else f"for {tag} yet"
+        await update.effective_message.reply_text(f"Nothing logged {scope}.")
+        return
+
+    month = _sum_buckets(_filter_month(own))
+    life = _sum_buckets(own)
+
+    now = datetime.now(TIMEZONE)
+    scope = "everyone" if show_all else tag
+    title = f"Report — {now.strftime('%B %Y')} · {scope}"
+
+    body = _render_report_block(
+        month, life, settings.currency_symbol, title=title
+    )
+    # Telegram renders <pre> as a monospace block on mobile and desktop.
+    # Escape HTML chars first since the body can contain user-controlled
+    # tag strings (someone's first name might in theory have <, >, &).
+    await update.effective_message.reply_html(f"<pre>{html.escape(body)}</pre>")
 
 
 async def cmd_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -114,22 +114,29 @@ def format_confirmation(
     for entry in entries:
         kind = entry.get("type", "expense")
         amt = float(entry["amount"])
-        # Only surface the context tag when it's not the default — keeps
-        # "personal" entries visually clean and makes overrides (MHUBEXP,
-        # etc.) stand out at a glance.
+        # Suffix surfaces context tag (when non-default) and loan flow
+        # so the user can verify the bot understood. Stay terse.
         ctx = (entry.get("context") or "").strip()
-        ctx_suffix = f" · {ctx}" if ctx and ctx != default_context else ""
+        flow = (entry.get("flow") or "regular").strip().lower()
+        suffix_parts: list[str] = []
+        if ctx and ctx != default_context:
+            suffix_parts.append(ctx)
+        if flow == "loan_taken":
+            suffix_parts.append("loan-taken")
+        elif flow == "loan_repaid":
+            suffix_parts.append("loan-repaid")
+        suffix = (" · " + " · ".join(suffix_parts)) if suffix_parts else ""
         if kind == "income":
             inc_total += amt
             lines.append(
                 f"• +{format_amount(amt, currency)} → {entry['category']} "
-                f"({entry['name']}){ctx_suffix} 💰"
+                f"({entry['name']}){suffix} 💰"
             )
         else:
             exp_total += amt
             lines.append(
                 f"• {format_amount(amt, currency)} → {entry['category']} "
-                f"({entry['name']}){ctx_suffix}"
+                f"({entry['name']}){suffix}"
             )
     if len(entries) > 1 or (exp_total and inc_total):
         if inc_total:
@@ -181,9 +188,17 @@ async def log_entries(
     logged: list[dict[str, Any]] = []
     last_id: str | None = None
     for entry in entries:
-        # Tag every entry with [<who>, <context>]. Skip empties so a
-        # missing context (legacy entries) doesn't write a "" tag.
-        entry_tags = [t for t in (tag, entry.get("context") or "") if t]
+        # Tag every entry with [<who>, <context>, <flow-marker>].
+        # Flow marker is only present when the entry is loan-related so the
+        # /report command (and the dashboard's tag dropdown) can separate
+        # loan flows from regular income/expense.
+        flow = (entry.get("flow") or "regular").strip().lower()
+        flow_tag = ""
+        if flow == "loan_taken":
+            flow_tag = "loan-taken"
+        elif flow == "loan_repaid":
+            flow_tag = "loan-repaid"
+        entry_tags = [t for t in (tag, entry.get("context") or "", flow_tag) if t]
         try:
             created = await owl.create(
                 name=entry["name"],
