@@ -35,10 +35,12 @@ services:
     networks:
       - tracker
 
-  # Filtering reverse proxy. Sits between Cloudflare Tunnel and ExpenseOwl
-  # so each authenticated user (CF Access email → tag map) sees only their
-  # own expenses at expenses.<your-domain>. LAN access via host:5006 still
-  # hits ExpenseOwl directly and remains unfiltered.
+  # HTML-injection reverse proxy. Sits between Cloudflare Tunnel and
+  # ExpenseOwl, injects a <script> into every dashboard page that adds
+  # a multi-select tag-filter dropdown to the pie chart (/) and the
+  # table (/table). Filtering is client-side via a fetch hook; the
+  # proxy itself does not filter any JSON. Selection persists in
+  # sessionStorage (sticky per browser session, default = show all).
   proxy:
     build: ./expense-proxy
     image: expense-proxy:latest
@@ -48,7 +50,6 @@ services:
       - expenseowl
     environment:
       - EXPENSEOWL_URL=http://expenseowl:8080
-      - EMAIL_TO_TAG=${EMAIL_TO_TAG:-}
       - TZ=Asia/Dhaka
     ports:
       # Published so the host-side cloudflared service can reach it.

@@ -1,59 +1,52 @@
-"""Filtering reverse proxy for ExpenseOwl.
+"""HTML-injection proxy for ExpenseOwl.
 
-Sits in front of ExpenseOwl's HTTP API. For each authenticated request
-(via Cloudflare Access), it filters GET /expenses so the dashboard only
-shows that user's tagged entries. Everything else passes through.
+Intercepts text/html responses and injects a single <script> tag that
+adds a multi-select tag-filter dropdown to every dashboard page (pie
+chart at /, table at /table, etc.). All filtering happens client-side
+via a monkey-patched window.fetch, so both the chart and the table are
+filtered uniformly by simply transforming the /expenses response that
+their existing JS already consumes.
 
-Identity comes from the `Cf-Access-Authenticated-User-Email` header that
-Cloudflare Access injects on every tunnel request. The email is mapped
-to a tag (the same tag the bot writes) via the EMAIL_TO_TAG env var.
+Filter selection persists in sessionStorage — sticky for the browser
+session, reverts to "show all" when the browser closes.
 
-Use `?all=1` on any URL to bypass filtering and see the unified view.
-
-EMAIL_TO_TAG=inkwell.sights@gmail.com:Saiful,user2@example.com:Aisha
+Notes:
+- Previously (briefly, 2026-05-23 morning) this proxy filtered
+  /expenses server-side by Cf-Access-Authenticated-User-Email. That
+  identity-based personalization was rolled back the same day in favor
+  of explicit user-controlled filtering.
+- The proxy makes no changes to non-HTML responses; they pass through
+  unmodified so PUT/DELETE/JSON endpoints work exactly as before.
 """
 from __future__ import annotations
 
-import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request, Response
+from fastapi.responses import FileResponse
 
 UPSTREAM = os.getenv("EXPENSEOWL_URL", "http://expenseowl:8080").rstrip("/")
 
-# Hop-by-hop headers and content-coding headers that must not be
-# forwarded as-is. httpx returns already-decompressed bodies, so the
-# upstream's Content-Encoding/Content-Length no longer applies once we
-# re-serialize.
+# Headers that must not be forwarded as-is when proxying responses.
+# httpx returns decompressed bodies, so the upstream's Content-Encoding
+# and Content-Length no longer apply after we (potentially) inject HTML.
 SKIP_RESPONSE_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
     "content-encoding", "content-length",
 }
 
+STATIC_DIR = Path(__file__).parent / "static"
+FILTER_JS_PATH = STATIC_DIR / "filter.js"
 
-def _parse_email_map() -> dict[str, str]:
-    raw = os.getenv("EMAIL_TO_TAG", "").strip()
-    if not raw:
-        return {}
-    out: dict[str, str] = {}
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk or ":" not in chunk:
-            continue
-        email, tag = chunk.split(":", 1)
-        email = email.strip().lower()
-        tag = tag.strip()
-        if email and tag:
-            out[email] = tag
-    return out
-
-
-EMAIL_TO_TAG = _parse_email_map()
+# The injection. `defer` so it runs after parsing but before
+# DOMContentLoaded — our fetch hook needs to be installed before
+# ExpenseOwl's own JS fires the first /expenses request.
+INJECT_TAG = b'<script src="/_proxy/filter.js" defer></script>'
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,9 +58,8 @@ logger = logging.getLogger("expense-proxy")
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     logger.info(
-        "Booted. Upstream=%s. Mapped emails: %s",
+        "Booted. Upstream=%s. Mode=html-injection (no server-side filtering).",
         UPSTREAM,
-        sorted(EMAIL_TO_TAG.keys()) or "(none — proxy is a pass-through)",
     )
     async with httpx.AsyncClient(
         base_url=UPSTREAM,
@@ -80,34 +72,38 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(title="expense-proxy", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 
-def _resolve_tag(request: Request) -> str | None:
-    """Return the tag to filter on, or None to skip filtering."""
-    if request.query_params.get("all") == "1":
-        return None
-    email = request.headers.get("cf-access-authenticated-user-email", "").strip().lower()
-    if not email:
-        return None
-    return EMAIL_TO_TAG.get(email)
+@app.get("/_proxy/filter.js")
+async def serve_filter_js() -> Response:
+    if not FILTER_JS_PATH.exists():
+        return Response(
+            content=b"// filter.js missing on server",
+            media_type="application/javascript",
+            status_code=500,
+        )
+    return FileResponse(
+        FILTER_JS_PATH,
+        media_type="application/javascript",
+        # Short cache so iterative edits propagate fast.
+        headers={"cache-control": "no-cache"},
+    )
 
 
-def _filter_expenses(payload: Any, tag: str) -> Any:
-    """Keep only entries whose tags array contains `tag`.
-
-    Preserves the response shape — ExpenseOwl may return a bare array or
-    `{"expenses": [...]}` depending on build.
-    """
-    def _keep(item: dict) -> bool:
-        return tag in (item.get("tags") or [])
-
-    if isinstance(payload, list):
-        return [e for e in payload if _keep(e)]
-    if isinstance(payload, dict) and isinstance(payload.get("expenses"), list):
-        return {**payload, "expenses": [e for e in payload["expenses"] if _keep(e)]}
-    return payload
-
-
-def _scrub_response_headers(headers: httpx.Headers) -> dict[str, str]:
+def _scrub_headers(headers: httpx.Headers) -> dict[str, str]:
     return {k: v for k, v in headers.items() if k.lower() not in SKIP_RESPONSE_HEADERS}
+
+
+def _looks_like_html(content_type: str | None) -> bool:
+    return bool(content_type and "text/html" in content_type.lower())
+
+
+def _inject_before_close(body: bytes) -> bytes:
+    """Inject the script tag before </body>, falling back to </html>, then append."""
+    lowered = body.lower()
+    for marker in (b"</body>", b"</html>"):
+        idx = lowered.rfind(marker)
+        if idx >= 0:
+            return body[:idx] + INJECT_TAG + body[idx:]
+    return body + INJECT_TAG
 
 
 @app.api_route(
@@ -136,30 +132,24 @@ async def proxy(path: str, request: Request) -> Response:
     except httpx.RequestError as exc:
         logger.exception("Upstream request failed: %s", exc)
         return Response(
-            content=json.dumps({"error": "upstream_unreachable"}).encode(),
+            content=b'{"error":"upstream_unreachable"}',
             media_type="application/json",
             status_code=502,
         )
 
-    if request.method == "GET" and path == "expenses":
-        tag = _resolve_tag(request)
-        if tag:
-            try:
-                payload = upstream_response.json()
-                filtered = _filter_expenses(payload, tag)
-                body_out = json.dumps(filtered).encode()
-                return Response(
-                    content=body_out,
-                    status_code=upstream_response.status_code,
-                    media_type="application/json",
-                    headers={"x-expense-proxy-filter": tag},
-                )
-            except (ValueError, json.JSONDecodeError):
-                logger.warning("Could not JSON-decode /expenses response; passing through unfiltered.")
+    content_type = upstream_response.headers.get("content-type")
+    if request.method == "GET" and _looks_like_html(content_type):
+        injected = _inject_before_close(upstream_response.content)
+        return Response(
+            content=injected,
+            status_code=upstream_response.status_code,
+            headers=_scrub_headers(upstream_response.headers),
+            media_type=content_type,
+        )
 
     return Response(
         content=upstream_response.content,
         status_code=upstream_response.status_code,
-        headers=_scrub_response_headers(upstream_response.headers),
-        media_type=upstream_response.headers.get("content-type"),
+        headers=_scrub_headers(upstream_response.headers),
+        media_type=content_type,
     )

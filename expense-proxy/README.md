@@ -1,68 +1,77 @@
 # expense-proxy
 
-Tiny FastAPI reverse proxy that filters ExpenseOwl's `GET /expenses`
-response by tag, so each Cloudflare-Access-authenticated user sees a
-personalized dashboard at the same URL.
+Tiny FastAPI reverse proxy that adds a tag-filter dropdown to every
+ExpenseOwl dashboard page by injecting a `<script>` into HTML
+responses. No server-side filtering — the script monkey-patches
+`fetch('/expenses')` so the existing chart and table render whatever
+subset the user picked.
 
 ## What it does
 
 ```
 expenses.example.com
    → Cloudflare Tunnel
-     → expense-proxy:5007   ← reads `Cf-Access-Authenticated-User-Email`
-       ↳ maps email → tag (EMAIL_TO_TAG env)
-       ↳ filters /expenses; passes everything else
+     → expense-proxy:5007
+       ↳ for text/html responses: inject <script src="/_proxy/filter.js">
+       ↳ serve /_proxy/filter.js (the widget + fetch hook)
+       ↳ everything else: pass through untouched
      → expenseowl:8080
 ```
 
-The pie chart on `/` and the table on `/table` both aggregate
-client-side from `GET /expenses`, so filtering one endpoint personalizes
-the whole dashboard with no UI changes.
+The injected script:
+
+- Renders a floating pill top-right of every page (pie chart, table,
+  settings, …).
+- Click → multi-select checkbox menu listing every tag seen so far.
+- Selecting tags filters the page's data using OR logic (an entry is
+  shown if any of its tags matches any selected tag). Empty selection
+  = show all.
+- Persists in `sessionStorage` (sticky for the browser session;
+  reverts to "show all" when the browser closes).
+- Triggers a page reload on selection change — the simplest reliable
+  way to re-render both ExpenseOwl's chart and its table after the
+  filter changes.
 
 ## Configuration
 
 | Env | Required | Notes |
 |---|---|---|
 | `EXPENSEOWL_URL` | yes | Upstream URL. Inside compose: `http://expenseowl:8080`. |
-| `EMAIL_TO_TAG` | for personalization | Comma list of `<email>:<tag>` pairs. Tag must match what the bot writes (a Telegram first name unless `USER_TAGS` overrides). Leave blank to act as a pure pass-through. |
 
-Example:
-
-```
-EMAIL_TO_TAG=inkwell.sights@gmail.com:Saiful,partner@example.com:Aisha
-```
-
-## Admin override
-
-Append `?all=1` to any dashboard URL (e.g. `/?all=1`, `/table?all=1`) to
-disable filtering and see the unified household view. Useful for
-audits — anyone with Cloudflare Access can use it (household-grade
-trust, not a security boundary).
-
-## Why not just give each user a deep link?
-
-ExpenseOwl `/table` does **not** accept `?tag=<name>` URL params — the
-tag filter is purely UI state with no query-string handling (verified
-in `internal/web/templates/functions.js`). So a URL-only approach
-doesn't work without forking ExpenseOwl.
+That's it. No per-user state, no email map, no secrets.
 
 ## Deploy
 
-The service is wired into the project's root `docker-compose.yml`. From
-the repo root:
+From the repo root:
 
 ```bash
 docker compose up -d --build proxy
 docker compose logs -f proxy
 ```
 
-Once the proxy is healthy, point the Cloudflare Tunnel ingress at host
-port **5007** instead of 5006:
+Then point the Cloudflare Tunnel ingress at host port **5007**:
 
 ```yaml
 - hostname: expenses.example.com
   service: http://localhost:5007
 ```
 
-LAN access via `http://<host>:5006` continues to hit ExpenseOwl directly
-(unfiltered) — only the public tunnel route is personalized.
+LAN access via `http://<host>:5006` continues to hit ExpenseOwl
+directly (no dropdown there).
+
+## Why this approach
+
+Building a dashboard fork or a CF Worker for one extra dropdown was
+overkill. Injecting a single `<script>` is a tiny diff that:
+
+- Works on every dashboard page automatically (anything served as
+  `text/html`).
+- Survives upstream ExpenseOwl upgrades unless they change `/expenses`
+  response shape.
+- Adds zero state to the proxy itself — selection lives in each
+  browser's `sessionStorage`.
+
+The earlier approach (server-side filtering by
+`Cf-Access-Authenticated-User-Email`) was rolled back because explicit
+user-controlled filtering is more transparent for a shared household
+dashboard.

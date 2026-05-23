@@ -130,30 +130,27 @@ ExpenseOwl ships with no authentication. To expose the dashboard safely on the p
 
 **Important:** the Cloudflare dashboard's "Public Hostname" form saves the full ingress list and can silently drop entries when you add another hostname. To self-heal, see `watchdog-bundle/` — a systemd timer that auto-restores your route every 5 min via the Cloudflare API. Run `watchdog-bundle/install.sh` as root on the box.
 
-## Optional: Personalized dashboard view (per-user filter)
+## Optional: Tag-filter dropdown on the dashboard
 
-ExpenseOwl is single-tenant, but if your tunnel is behind Cloudflare Access you can hand each authenticated user a personalized view at the same URL. The `expense-proxy` service sits between the tunnel and ExpenseOwl, reads the `Cf-Access-Authenticated-User-Email` header, and filters `GET /expenses` to only entries that carry that user's tag.
+ExpenseOwl's pie chart at `/` and table at `/table` aggregate from `GET /expenses` client-side, but neither page exposes a tag filter for the VIEW (the `/table` tag UI is for adding new expenses, not filtering rows). The `expense-proxy` service plugs that gap by injecting a small `<script>` into every dashboard HTML response. The script:
+
+- Adds a floating multi-select pill (top-right) that lists every tag the dashboard has loaded.
+- Monkey-patches `window.fetch` so `/expenses` responses are narrowed to entries whose tags intersect the selected set (OR logic). Both the chart and the table reflect the filter uniformly.
+- Persists selection in `sessionStorage` — sticky for the browser session, reverts to "show all" when the browser closes.
 
 ```
 expenses.your-domain.com
    → Cloudflare Tunnel
-     → expense-proxy:5007  (filters /expenses by tag from CF Access email)
+     → expense-proxy:5007  (injects <script> into HTML; passes JSON through)
        → expenseowl:8080
 ```
 
-Because both the pie chart on `/` and the table on `/table` aggregate client-side from `GET /expenses`, filtering that single endpoint personalizes the whole dashboard with no UI changes.
-
 To enable:
 
-1. Set `EMAIL_TO_TAG` in `.env`:
-   ```
-   EMAIL_TO_TAG=you@example.com:Saiful,partner@example.com:Aisha
-   ```
-   The tag must match what the bot writes (the user's Telegram first name, or the `USER_TAGS` override).
-2. `docker compose up -d --build proxy`
-3. Update your Cloudflare Tunnel ingress to point at `http://localhost:5007` instead of `5006`.
+1. `docker compose up -d --build proxy`
+2. Point your Cloudflare Tunnel ingress at `http://localhost:5007` instead of `5006`. LAN access via `http://<host>:5006` continues to hit ExpenseOwl directly without the dropdown.
 
-`?all=1` on any URL disables filtering for that page load (household audit view). LAN access via `http://<host>:5006` continues to hit ExpenseOwl directly, unfiltered. See `expense-proxy/README.md` for full details.
+The proxy is pure pass-through for non-HTML responses, so PUT/DELETE/JSON behaviour is unchanged. See `expense-proxy/README.md` for full details.
 
 ## File layout
 
