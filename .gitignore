@@ -9,3 +9,8 @@ data/
 .DS_Store
 .idea/
 .vscode/
+
+# Host-specific Compose overrides (e.g. port remaps for an existing
+# Cloudflare Tunnel ingress). Each box keeps its own; never committed.
+docker-compose.override.yml
+docker-compose.override.yaml
