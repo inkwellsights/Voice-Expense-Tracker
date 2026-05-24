@@ -302,16 +302,6 @@ def _entry_local_date(exp: dict[str, Any]):
     return when.astimezone(TIMEZONE).date()
 
 
-# Box-drawing primitives (U+2500 range — single-cell width in every
-# Telegram monospace font we tested). All rendered inside <pre> blocks
-# so the alignment holds on both mobile and desktop.
-_BX = {
-    "h": "─", "v": "│",
-    "tl": "┌", "tr": "┐", "bl": "└", "br": "┘",
-    "tm": "┬", "bm": "┴", "lm": "├", "rm": "┤", "x": "┼",
-}
-
-
 def _truncate(s: str, width: int) -> str:
     if len(s) <= width:
         return s
@@ -329,32 +319,21 @@ def _cell_amount(amount: float) -> str:
 
 
 # ---- /report daily-ledger table layout ----
-# Column widths chosen so the boxed table is 36 chars wide total — fits
-# every phone we've tested in portrait monospace. Bump _COL_ITEM if your
-# day descriptions regularly truncate.
-_COL_DATE, _COL_ITEM, _COL_OUT, _COL_IN = 5, 12, 7, 7
-_BOX_W = 1 + _COL_DATE + 1 + _COL_ITEM + 1 + _COL_OUT + 1 + _COL_IN + 1  # = 36
+# Whitespace-aligned columns, no vertical bars — box-drawing characters
+# render with visible gaps in many Android monospace fonts (verified on
+# user's phone 2026-05-24). Horizontal-line dividers (─, U+2500) render
+# solid across fonts, so we still get a "Excel-ish" header underline +
+# totals divider without depending on box-drawing alignment.
+_COL_DATE, _COL_ITEM, _COL_OUT, _COL_IN = 5, 13, 7, 7
+_REPORT_W = _COL_DATE + 1 + _COL_ITEM + 1 + _COL_OUT + 1 + _COL_IN  # = 35
 
 
-def _box_border(left: str, mid: str, right: str) -> str:
-    """One border line (top / middle-divider / bottom) for the /report table."""
+def _table_line(date: str, item: str, out: str, in_: str) -> str:
     return (
-        left
-        + _BX["h"] * _COL_DATE + mid
-        + _BX["h"] * _COL_ITEM + mid
-        + _BX["h"] * _COL_OUT + mid
-        + _BX["h"] * _COL_IN + right
-    )
-
-
-def _box_row(date: str, item: str, out: str, in_: str) -> str:
-    v = _BX["v"]
-    return (
-        v + date.ljust(_COL_DATE)
-        + v + item.ljust(_COL_ITEM)
-        + v + out.rjust(_COL_OUT)
-        + v + in_.rjust(_COL_IN)
-        + v
+        f"{date:<{_COL_DATE}} "
+        f"{item:<{_COL_ITEM}} "
+        f"{out:>{_COL_OUT}} "
+        f"{in_:>{_COL_IN}}"
     )
 
 
@@ -438,29 +417,19 @@ def _format_loan_amount(amount: float, currency: str) -> str:
     return f"{currency}{int(round(amount)):,}"
 
 
-# /loan boxed-section width — matched to /report so both commands feel
-# like part of the same UI. Inside the box, content gets 1 char of
-# horizontal padding on each side, so usable width = _BOX_W − 4.
-_LOAN_BOX_W = _BOX_W           # 36 chars wall-to-wall
-_LOAN_CONTENT_W = _LOAN_BOX_W - 4   # 32 chars of usable space inside
+# /loan layout: whitespace-aligned sections separated by horizontal
+# rules. No box-drawing borders — they fragment in some Android
+# monospace fonts (see /report comment above).
+_LOAN_W = _REPORT_W + 1  # 36 — matches /report's visual rhythm
 
 
-def _loan_box_h(left: str, right: str) -> str:
-    return left + _BX["h"] * (_LOAN_BOX_W - 2) + right
-
-
-def _loan_box_line(content: str) -> str:
-    """One body line of a loan box. Content gets clipped if too long."""
-    text = _truncate(content, _LOAN_CONTENT_W).ljust(_LOAN_CONTENT_W)
-    return _BX["v"] + " " + text + " " + _BX["v"]
-
-
-def _loan_pair_line(label: str, value: str) -> str:
-    """Two-column-ish row inside a loan box: label left, value right."""
-    space = _LOAN_CONTENT_W - len(label) - len(value)
-    if space < 1:
-        space = 1
-    return _loan_box_line(label + " " * space + value)
+def _loan_pair(label: str, value: str, indent: int = 2) -> str:
+    """Label left, value right-aligned to the full loan-section width."""
+    available = _LOAN_W - indent
+    gap = available - len(label) - len(value)
+    if gap < 1:
+        gap = 1
+    return " " * indent + label + " " * gap + value
 
 
 async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -513,7 +482,8 @@ async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sections: list[str] = [f"🏦 Loans · {scope_name}", ""]
     total_outstanding = 0.0
 
-    for name in sorted(buckets.keys(), key=sort_key):
+    sorted_names = sorted(buckets.keys(), key=sort_key)
+    for idx, name in enumerate(sorted_names):
         b = buckets[name]
         outstanding = b["taken"] - b["repaid"]
         total_outstanding += outstanding
@@ -522,14 +492,16 @@ async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "settled ✓" if outstanding <= 0
             else f"{cur}{int(round(outstanding)):,} left"
         )
-        header_label = _loan_display_name(name)
-
-        sections.append(_loan_box_h(_BX["tl"], _BX["tr"]))
-        sections.append(_loan_pair_line(header_label, f"({header_status})"))
-        sections.append(_loan_box_h(_BX["lm"], _BX["rm"]))
-        sections.append(_loan_pair_line("Taken", f"{cur}{int(round(b['taken'])):,}"))
-        sections.append(_loan_pair_line("Repaid", f"{cur}{int(round(b['repaid'])):,}"))
-        sections.append(_loan_pair_line("Out", _format_loan_amount(outstanding, cur)))
+        # Per-loan section: NAME line with status right-aligned, then
+        # the three summary rows, then (when present) Recent: + events.
+        # Sections are separated by a full-width horizontal rule —
+        # solid in every font we've seen, unlike box-drawing chars.
+        sections.append(
+            _loan_pair(_loan_display_name(name), f"({header_status})", indent=0)
+        )
+        sections.append(_loan_pair("Taken", f"{cur}{int(round(b['taken'])):,}"))
+        sections.append(_loan_pair("Repaid", f"{cur}{int(round(b['repaid'])):,}"))
+        sections.append(_loan_pair("Out", _format_loan_amount(outstanding, cur)))
 
         # Recent events, oldest first within the last-5 window so the
         # ledger reads naturally top-to-bottom in chronological order.
@@ -539,27 +511,28 @@ async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reverse=True,
         )[:5]
         if events_by_date:
-            sections.append(_loan_box_h(_BX["lm"], _BX["rm"]))
-            sections.append(_loan_box_line("Recent:"))
-            # Description width chosen so the date(5) + 2-space + desc + 1-space + amount(7)
-            # fits inside _LOAN_CONTENT_W (32). 5 + 2 + N + 1 + 7 = 32 → N = 17.
-            desc_w = _LOAN_CONTENT_W - 5 - 2 - 1 - 7
+            sections.append("  Recent:")
+            # date(5) + 2-space + desc + 1-space + amount(8) ≤ available width
+            available = _LOAN_W - 4  # 4-space indent inside Recent:
+            desc_w = available - 5 - 2 - 1 - 8
             for e, flow, magnitude in reversed(events_by_date):
                 d = _entry_local_date(e)
                 date_str = d.strftime("%d/%m") if d else "?"
                 sign = "+" if flow == "taken" else "−"
                 desc = _truncate(str(e.get("name") or "?"), desc_w)
                 amount_str = f"{sign}{int(round(magnitude)):,}"
-                line = f"{date_str}  {desc:<{desc_w}} {amount_str:>7}"
-                sections.append(_loan_box_line(line))
-        sections.append(_loan_box_h(_BX["bl"], _BX["br"]))
-        sections.append("")  # gap between loan blocks
+                sections.append(
+                    f"    {date_str}  {desc:<{desc_w}} {amount_str:>8}"
+                )
 
-    # Strip trailing blank line before footer
-    while sections and sections[-1] == "":
-        sections.pop()
+        # Divider between loan blocks (but not after the last one).
+        if idx != len(sorted_names) - 1:
+            sections.append("")
+            sections.append("─" * _LOAN_W)
+            sections.append("")
+
     sections.append("")
-    sections.append(_BX["h"] * _LOAN_BOX_W)
+    sections.append("─" * _LOAN_W)
     sections.append(
         f"TOTAL OUTSTANDING: {cur}{int(round(total_outstanding)):,}"
     )
@@ -611,32 +584,20 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     body_lines: list[str] = [
         f"{now.strftime('%B %Y')} · {scope_name}",
         "",
-        _box_border(_BX["tl"], _BX["tm"], _BX["tr"]),
-        _box_row("Date", "Item", "Out", "In"),
-        _box_border(_BX["lm"], _BX["x"], _BX["rm"]),
+        _table_line("Date", "Item", "Out", "In"),
+        "─" * _REPORT_W,
     ]
     if daily:
         for r in daily:
             body_lines.append(
-                _box_row(
-                    r["date"], r["item"],
-                    _cell_amount(r["out"]), _cell_amount(r["in"]),
-                )
+                _table_line(r["date"], r["item"], _cell_amount(r["out"]), _cell_amount(r["in"]))
             )
-        body_lines.append(_box_border(_BX["lm"], _BX["x"], _BX["rm"]))
+        body_lines.append("─" * _REPORT_W)
         body_lines.append(
-            _box_row(
-                "TOTAL", "",
-                _cell_amount(total_out), _cell_amount(total_in),
-            )
+            _table_line("TOTAL", "", _cell_amount(total_out), _cell_amount(total_in))
         )
-        body_lines.append(_box_border(_BX["bl"], _BX["bm"], _BX["br"]))
     else:
-        # Empty-month bottom: just close the table; no TOTAL row needed.
-        body_lines.append(
-            _box_row("", "(no entries yet)", "", "")
-        )
-        body_lines.append(_box_border(_BX["bl"], _BX["bm"], _BX["br"]))
+        body_lines.append("  (no entries yet)")
 
     # Below the table: loans + outstanding + net so the user can read
     # the "what's happening with loans" story without re-summing rows.
