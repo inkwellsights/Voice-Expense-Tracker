@@ -17,9 +17,28 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+from pathlib import Path
 from typing import Optional
+
+
+# Windows + Python 3.8+ restricts the legacy "search PATH for DLLs"
+# behaviour. Even with the right directory on PATH, ctranslate2 can't
+# load cuDNN / cuBLAS because LoadLibrary now requires an explicit
+# os.add_dll_directory() registration. We do this BEFORE importing
+# faster_whisper so the transitive ctranslate2 load picks it up.
+if sys.platform == "win32":
+    _here = Path(__file__).resolve().parent
+    _candidates = [
+        _here / ".venv" / "Lib" / "site-packages" / "nvidia" / "cudnn" / "bin",
+        _here / ".venv" / "Lib" / "site-packages" / "nvidia" / "cublas" / "bin",
+        _here / ".venv" / "Lib" / "site-packages" / "nvidia" / "cuda_nvrtc" / "bin",
+    ]
+    for _d in _candidates:
+        if _d.is_dir():
+            os.add_dll_directory(str(_d))
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from faster_whisper import WhisperModel
