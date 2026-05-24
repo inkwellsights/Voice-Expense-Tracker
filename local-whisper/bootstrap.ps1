@@ -41,14 +41,18 @@ if (-not $isAdmin) {
 }
 
 # --- Step 1: Python check ---
-Write-Step "Checking Python 3.10+"
+# Need 3.10..3.12. faster-whisper 1.0.3 pulls `av`, which has no Windows
+# wheel for 3.13 yet and falls back to source builds that need FFmpeg
+# headers locally. Avoid the rabbit hole - try the py launcher first.
+Write-Step "Checking for Python 3.10/3.11/3.12"
 $pyPath = $null
-foreach ($cmd in @("python", "py -3")) {
+$candidates = @("py -3.12", "py -3.11", "py -3.10", "python", "py -3")
+foreach ($cmd in $candidates) {
     try {
         $ver = & cmd.exe /c "$cmd --version 2>&1"
         if ($ver -match "Python (\d+)\.(\d+)") {
             $maj = [int]$Matches[1]; $min = [int]$Matches[2]
-            if ($maj -eq 3 -and $min -ge 10) {
+            if ($maj -eq 3 -and $min -ge 10 -and $min -le 12) {
                 $pyPath = $cmd
                 Write-OK "found $ver via '$cmd'"
                 break
@@ -57,7 +61,7 @@ foreach ($cmd in @("python", "py -3")) {
     } catch {}
 }
 if (-not $pyPath) {
-    Die "Python 3.10+ not found. Install from https://www.python.org/downloads/windows/ (tick 'Add to PATH'), then re-run."
+    Die "Need Python 3.10, 3.11, or 3.12 (NOT 3.13). Install 3.12 from https://www.python.org/downloads/release/python-31210/ (tick 'Add python.exe to PATH'), then re-run."
 }
 
 # --- Step 2: nvidia-smi check ---
@@ -89,9 +93,11 @@ if (-not (Test-Path "$ROOT\.venv\Scripts\python.exe")) {
     Write-OK ".venv already exists"
 }
 
-Write-Step "Installing dependencies (this can take 2-3 minutes)"
+Write-Step "Installing dependencies (this can take 5-7 minutes; cuDNN is ~600MB)"
 & "$ROOT\.venv\Scripts\python.exe" -m pip install --upgrade pip --quiet
-& "$ROOT\.venv\Scripts\python.exe" -m pip install -r "$ROOT\requirements.txt" --quiet
+if ($LASTEXITCODE -ne 0) { Die "pip upgrade failed (exit $LASTEXITCODE)" }
+& "$ROOT\.venv\Scripts\python.exe" -m pip install -r "$ROOT\requirements.txt"
+if ($LASTEXITCODE -ne 0) { Die "pip install failed (exit $LASTEXITCODE); see above for the failing package" }
 Write-OK "deps installed"
 
 # --- Step 5: pre-download model ---

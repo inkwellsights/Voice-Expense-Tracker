@@ -2,3 +2,9 @@ faster-whisper==1.0.3
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 python-multipart==0.0.20
+# faster-whisper 1.0.3 imports requests but doesn't declare it.
+requests>=2.31
+# ctranslate2 >= 4.5 (pulled in by faster-whisper) needs cuDNN 9 for CUDA 12.
+# NVIDIA ships it as a pip package; whisper-server.ps1 prepends its bin/ to PATH.
+nvidia-cudnn-cu12>=9.0,<10
+nvidia-cublas-cu12>=12.0
