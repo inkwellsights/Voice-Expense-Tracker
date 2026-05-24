@@ -65,7 +65,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await status.edit_text("🎧 Transcribing…")
     try:
         transcript = await transcribe(
-            audio_bytes, api_key=settings.groq_api_key, filename=filename
+            audio_bytes,
+            api_key=settings.groq_api_key,
+            filename=filename,
+            local_url=settings.local_whisper_url,
+            local_timeout=settings.local_whisper_timeout,
         )
     except TranscriptionError as exc:
         await status.edit_text(f"❌ Transcription failed: {exc}")

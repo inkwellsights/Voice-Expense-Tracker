@@ -59,6 +59,11 @@ class Settings:
     # ("masnoonhub", "mhubexpress", "masnoon hub express") and the bot
     # collapse all of them to one canonical tag ("MHUBEXP").
     context_synonyms: dict[str, list[str]] = field(default_factory=dict)
+    # Optional self-hosted Whisper endpoint (OpenAI-compatible).
+    # When set, the bot tries this before Groq; on any connect failure /
+    # timeout / 5xx the cloud Groq path runs instead. Empty = cloud-only.
+    local_whisper_url: str = ""
+    local_whisper_timeout: float = 8.0
 
 
 def _require(name: str) -> str:
@@ -181,4 +186,8 @@ def load_settings() -> Settings:
         ),
         context_default=(os.getenv("TAG_DEFAULT", "personal").strip() or "personal"),
         context_synonyms=_parse_context_synonyms(),
+        local_whisper_url=os.getenv("LOCAL_WHISPER_URL", "").strip().rstrip("/"),
+        local_whisper_timeout=float(
+            os.getenv("LOCAL_WHISPER_TIMEOUT_SECONDS", "8") or 8
+        ),
     )

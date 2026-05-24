@@ -1,7 +1,14 @@
-"""Groq Whisper transcription client.
+"""Whisper transcription with optional local-first cascade.
 
-Uses whisper-large-v3-turbo, which handles Bangla, English, and code-switched
-Banglish natively. Free tier limit ~28,800 seconds of audio per day.
+Order of operations per call:
+  1. If `local_url` is set, POST the audio there with a short timeout.
+     - 200 → return text (subject to the same confidence guard as cloud).
+     - 503 (gpu busy gate), connect-refused, connect-timeout, read-timeout,
+       or any other 5xx → log and fall through to Groq.
+  2. POST to Groq's hosted whisper-large-v3 as the cloud fallback.
+
+The local server is run by `local-whisper/` in this repo. Its GPU-busy gate
+makes 503 a normal, expected response — meaning "use the cloud instead".
 """
 from __future__ import annotations
 
@@ -47,8 +54,69 @@ def _aggregate_confidence(segments: list[dict]) -> tuple[float, float]:
     return no_speech, avg_logprob
 
 
-async def transcribe(audio_bytes: bytes, *, api_key: str, filename: str = "voice.ogg") -> str:
-    """Transcribe a voice file via Groq's OpenAI-compatible endpoint."""
+def _extract_text(data: dict, source: str) -> str:
+    """Pull text + confidence-guard a whisper response (local or cloud)."""
+    text = (data.get("text") or "").strip()
+    if not text:
+        raise TranscriptionError(f"{source} returned an empty transcript.")
+    segments = data.get("segments") or []
+    no_speech, avg_logprob = _aggregate_confidence(segments)
+    logger.info(
+        "Transcript (%s): %s  [no_speech=%.2f avg_logprob=%.2f segs=%d]",
+        source, text, no_speech, avg_logprob, len(segments),
+    )
+    if no_speech > MAX_NO_SPEECH_PROB or avg_logprob < MIN_AVG_LOGPROB:
+        raise LowConfidenceTranscript(
+            f"Couldn't make out the audio (no_speech={no_speech:.0%}, "
+            f"avg_logprob={avg_logprob:.2f}). Try a slightly longer clip "
+            f"in a quieter spot."
+        )
+    return text
+
+
+async def _try_local(
+    audio_bytes: bytes, *, url: str, timeout: float, filename: str
+) -> str | None:
+    """Try the local Whisper server. Returns text on success, None on fallthrough.
+
+    LowConfidenceTranscript bubbles up (it's a real transcript that failed the
+    guard — no point asking the cloud the same question). Everything else
+    (transport errors, 503, 5xx) returns None so the caller hits Groq.
+    """
+    files = {
+        "file": (filename, audio_bytes, "audio/ogg"),
+        "model": (None, MODEL),
+        "response_format": (None, "verbose_json"),
+        "temperature": (None, "0"),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(url, files=files)
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
+        logger.warning("local whisper unreachable (%s); falling back to Groq", type(exc).__name__)
+        return None
+    except httpx.HTTPError as exc:
+        logger.warning("local whisper transport error (%s); falling back to Groq", exc)
+        return None
+
+    if response.status_code == 503:
+        # GPU-busy gate said no. Expected, not an error.
+        logger.info("local whisper busy (503: %s); falling back to Groq", response.text[:120])
+        return None
+    if response.status_code >= 500:
+        logger.warning("local whisper %s: %s; falling back to Groq", response.status_code, response.text[:120])
+        return None
+    if response.status_code != 200:
+        # 4xx — something we sent is wrong. Fail fast rather than hide it.
+        raise TranscriptionError(
+            f"Local Whisper returned {response.status_code}: {response.text[:300]}"
+        )
+    return _extract_text(response.json(), source="local")
+
+
+async def _try_groq(
+    audio_bytes: bytes, *, api_key: str, filename: str
+) -> str:
     files = {
         "file": (filename, audio_bytes, "audio/ogg"),
         "model": (None, MODEL),
@@ -77,22 +145,22 @@ async def transcribe(audio_bytes: bytes, *, api_key: str, filename: str = "voice
         raise TranscriptionError(
             f"Groq returned {response.status_code}: {response.text[:300]}"
         )
+    return _extract_text(response.json(), source="groq")
 
-    data = response.json()
-    text = (data.get("text") or "").strip()
-    if not text:
-        raise TranscriptionError("Groq returned an empty transcript.")
 
-    segments = data.get("segments") or []
-    no_speech, avg_logprob = _aggregate_confidence(segments)
-    logger.info(
-        "Transcript: %s  [no_speech=%.2f avg_logprob=%.2f segs=%d]",
-        text, no_speech, avg_logprob, len(segments),
-    )
-    if no_speech > MAX_NO_SPEECH_PROB or avg_logprob < MIN_AVG_LOGPROB:
-        raise LowConfidenceTranscript(
-            f"Couldn't make out the audio (no_speech={no_speech:.0%}, "
-            f"avg_logprob={avg_logprob:.2f}). Try a slightly longer clip "
-            f"in a quieter spot."
+async def transcribe(
+    audio_bytes: bytes,
+    *,
+    api_key: str,
+    filename: str = "voice.ogg",
+    local_url: str = "",
+    local_timeout: float = 8.0,
+) -> str:
+    """Local-first transcription. Falls back to Groq on any local failure."""
+    if local_url:
+        text = await _try_local(
+            audio_bytes, url=local_url, timeout=local_timeout, filename=filename
         )
-    return text
+        if text is not None:
+            return text
+    return await _try_groq(audio_bytes, api_key=api_key, filename=filename)
