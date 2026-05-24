@@ -32,7 +32,7 @@ if (-not $isAdmin) {
     Write-Step "Re-launching elevated (UAC prompt)..."
     $scriptPath = $MyInvocation.MyCommand.Path
     if (-not $scriptPath) {
-        # Running via iex/irm with no on-disk path — save self first.
+        # Running via iex/irm with no on-disk path - save self first.
         $scriptPath = "$env:TEMP\wb.ps1"
         $MyInvocation.MyCommand.Definition | Out-File -FilePath $scriptPath -Encoding UTF8
     }
@@ -166,7 +166,7 @@ for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Seconds 2
 }
 if (-not $ok) {
-    Write-Warn "health probe didn't succeed in 60s — check C:\local-whisper\logs\ for errors"
+    Write-Warn "health probe didn't succeed in 60s - check C:\local-whisper\logs\ for errors"
 } else {
     Write-OK "server up at http://localhost:$PORT"
 }
