@@ -39,6 +39,7 @@ from .handlers.commands import (
     cmd_today,
     cmd_undo,
     cmd_users,
+    cmd_vocab,
 )
 from .handlers.photo import handle_photo
 from .handlers.text import handle_text
@@ -46,6 +47,7 @@ from .handlers.voice import handle_voice
 from .services.allowlist import Allowlist
 from .services.expenseowl import ExpenseOwl
 from .services.loan_aliases import LoanAliases
+from .services.vocabulary import Vocabulary
 from .services import parser as parser_service
 
 # Where the dynamic-allowlist JSON lives. Inside Docker we mount /app/data
@@ -97,6 +99,9 @@ def build_application() -> Application:
     application.bot_data["loan_aliases"] = LoanAliases(
         json_path=DATA_DIR / "loan_aliases.json",
     )
+    application.bot_data["vocabulary"] = Vocabulary(
+        json_path=DATA_DIR / "vocabulary.json",
+    )
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
@@ -106,6 +111,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("loan", cmd_loan))
     application.add_handler(CommandHandler("categories", cmd_categories))
     application.add_handler(CommandHandler("undo", cmd_undo))
+    application.add_handler(CommandHandler("vocab", cmd_vocab))
     # Admin: manage allowlist at runtime
     application.add_handler(CommandHandler("allow", cmd_allow))
     application.add_handler(CommandHandler("revoke", cmd_revoke))

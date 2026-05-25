@@ -19,6 +19,7 @@ from .common import (
     get_loan_aliases,
     get_owl,
     get_settings,
+    get_vocabulary,
     is_admin,
     is_authorised,
     user_tag,
@@ -73,6 +74,7 @@ def _build_help_text(
             "/loan merge `<from>` `<to>` — collapse mistranscribed names "
             "(e.g. `/loan merge ikbal iqbal`)",
             "/loan aliases — list active merges",
+            "/vocab — fix recurring ASR mishears (e.g. `/vocab add cloth Claude`)",
             "/categories — list valid categories",
             "/undo — delete your last logged entry",
         ]
@@ -1362,6 +1364,87 @@ async def cmd_revoke(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
     elif result == "not-found":
         await msg.reply_text(f"User {target} is not on the allowlist.")
+
+
+async def cmd_vocab(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/vocab` — manage user-level ASR mishear corrections.
+
+    Subcommands:
+      /vocab add <wrong> <right>   register a substitution (case-insensitive)
+      /vocab remove <wrong>        delete one
+      /vocab list                  show current map
+      /vocab                       help
+
+    Word-boundary matching: "cloth -> Claude" rewrites "cloth" but leaves
+    "clothing" alone. Right-side may be multi-word: `/vocab add CNG van auto-rickshaw`.
+    """
+    msg = update.effective_message
+    if not is_authorised(update, context):
+        return
+    args = getattr(context, "args", None) or []
+    vocab = get_vocabulary(context)
+
+    if not args or args[0].lower() in ("help", "?"):
+        await msg.reply_markdown(
+            "*Vocabulary corrections* — fix recurring ASR mishears.\n\n"
+            "`/vocab add cloth Claude`  → log \"cloth\" as \"Claude\"\n"
+            "`/vocab add vev vape`      → log \"vev\" as \"vape\"\n"
+            "`/vocab list`              → show all\n"
+            "`/vocab remove cloth`      → forget that correction\n\n"
+            "Word-boundary match: \"cloth\" → \"Claude\" but \"clothing\" stays."
+        )
+        return
+
+    sub = args[0].lower()
+    if sub == "list":
+        m = vocab.all_aliases()
+        if not m:
+            await msg.reply_text(
+                "No vocabulary corrections set. "
+                "Add one with `/vocab add <heard> <intended>`"
+            )
+            return
+        lines = ["*Vocabulary:*"]
+        for k in sorted(m.keys(), key=str.lower):
+            lines.append(f"• `{k}` → `{m[k]}`")
+        await msg.reply_markdown("\n".join(lines))
+        return
+
+    if sub == "add":
+        if len(args) < 3:
+            await msg.reply_markdown(
+                "Usage: `/vocab add <wrong> <right>`\n"
+                "Example: `/vocab add cloth Claude`"
+            )
+            return
+        wrong = args[1]
+        right = " ".join(args[2:])
+        status = await vocab.add(wrong, right)
+        if status == "rejected-self":
+            await msg.reply_text(f"❌ '{wrong}' and '{right}' are the same.")
+        elif status == "rejected-empty":
+            await msg.reply_text("❌ Both sides must be non-empty.")
+        elif status == "updated":
+            await msg.reply_markdown(f"✏️ Updated: `{wrong}` → `{right}`")
+        else:
+            await msg.reply_markdown(f"✅ Added: `{wrong}` → `{right}`")
+        return
+
+    if sub == "remove":
+        if len(args) < 2:
+            await msg.reply_markdown("Usage: `/vocab remove <wrong>`")
+            return
+        wrong = args[1]
+        result = await vocab.remove(wrong)
+        if result == "not-found":
+            await msg.reply_text(f"No correction set for '{wrong}'.")
+        else:
+            await msg.reply_text(f"↩️ Removed '{wrong}'.")
+        return
+
+    await msg.reply_markdown(
+        f"Unknown subcommand `{sub}`. Try `/vocab` for help."
+    )
 
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

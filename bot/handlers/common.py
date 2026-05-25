@@ -12,6 +12,7 @@ from ..config import TIMEZONE, Settings
 from ..services.allowlist import Allowlist
 from ..services.expenseowl import ExpenseOwl, ExpenseOwlError
 from ..services.loan_aliases import LoanAliases
+from ..services.vocabulary import Vocabulary
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,10 @@ def get_allowlist(context: ContextTypes.DEFAULT_TYPE) -> Allowlist:
 
 def get_loan_aliases(context: ContextTypes.DEFAULT_TYPE) -> LoanAliases:
     return context.application.bot_data["loan_aliases"]
+
+
+def get_vocabulary(context: ContextTypes.DEFAULT_TYPE) -> Vocabulary:
+    return context.application.bot_data["vocabulary"]
 
 
 def is_authorised(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -199,6 +204,19 @@ async def log_entries(
     """
     settings = get_settings(context)
     owl = get_owl(context)
+
+    # Apply the user-managed vocabulary substitution (e.g. "cloth" → "Claude")
+    # to entry name + loan_name + the heard echo. Catches ASR mishears the
+    # user has explicitly corrected via /vocab add. Word-boundary regex
+    # inside Vocabulary.canonical keeps it safe for partial overlaps.
+    vocab = get_vocabulary(context)
+    for entry in entries:
+        if entry.get("name"):
+            entry["name"] = vocab.canonical(entry["name"])
+        if entry.get("loan_name"):
+            entry["loan_name"] = vocab.canonical(entry["loan_name"])
+    if heard:
+        heard = vocab.canonical(heard)
 
     # FX conversion: parser may emit a non-default `currency` (e.g. "USD").
     # Convert to the bot's base currency (BDT) using settings.currency_rates,

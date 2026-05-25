@@ -86,6 +86,8 @@ Be tolerant of Whisper mistranscriptions:
 - "shura ka"/"shuruka" = taka
 - "bargar"=burger, "raisten"=rice
 - "discover"/"discovery"/"diskover" likely = "rickshaw" (Banglish ASR mishears the soft "r" + "iksh" cluster)
+- "cloth"/"clot"/"closth" likely = "Claude" (the AI assistant brand — common purchase line item)
+- "vev"/"veh"/"vab" likely = "vape" (e-cigarette product)
 - "vara"/"bhara"/"bara" = fare (transport bhara is the fare for a vehicle)
 - "rickshaw vara"/"rickshaw bhara"/"riksha vara"/"discover vara" = rickshaw fare → name "rickshaw", category Transport
 - "CNG vara"/"CNG bhara" = autorickshaw fare → name "CNG", category Transport
