@@ -608,8 +608,7 @@ async def _call_groq_llm(message: str) -> str:
 
 
 _ALL_EXHAUSTED_MSG = (
-    "All AI providers are currently throttled or unavailable. "
-    "Please try again in a few minutes."
+    "Sorry, AI services are stuttering. Try again in a minute."
 )
 
 
@@ -658,7 +657,11 @@ async def _text_cascade(message: str, *, api_key: str) -> str:
     else:
         logger.info("Cascade: skipping groq llm (not configured)")
 
-    raise ParseError(f"{_ALL_EXHAUSTED_MSG} (tried: {'; '.join(failures)})")
+    # Keep the diagnostic detail in logs (which I can grep when debugging),
+    # but raise a terse user-friendly message — the operator doesn't need
+    # to read "gemini: 429 ...; local: ConnectError ...; groq: ..." in chat.
+    logger.error("All providers exhausted. tried: %s", "; ".join(failures))
+    raise ParseError(_ALL_EXHAUSTED_MSG)
 
 
 async def parse_text(message: str, *, api_key: str) -> list[dict[str, Any]]:
