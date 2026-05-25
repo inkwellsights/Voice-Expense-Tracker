@@ -1,14 +1,16 @@
-"""Whisper transcription with optional local-first cascade.
+"""Whisper transcription with cloud-first cascade.
 
-Order of operations per call:
-  1. If `local_url` is set, POST the audio there with a short timeout.
-     - 200 → return text (subject to the same confidence guard as cloud).
-     - 503 (gpu busy gate), connect-refused, connect-timeout, read-timeout,
-       or any other 5xx → log and fall through to Groq.
-  2. POST to Groq's hosted whisper-large-v3 as the cloud fallback.
+Order of operations per call (per user pref):
+  1. POST to Groq's hosted whisper-large-v3 first (cloud, fast, generous
+     free tier, ~0.5s typical).
+  2. If Groq fails (network, 4xx, 5xx, low-confidence transcript), fall
+     back to local Whisper on the 3090 if configured.
+  3. If both fail, raise.
 
-The local server is run by `local-whisper/` in this repo. Its GPU-busy gate
-makes 503 a normal, expected response — meaning "use the cloud instead".
+Why cloud-first: Groq Whisper is consistently fast with no cold-start
+penalty, and its free tier is generous. The local 3090 is the offline
+failsafe — slower when warm, much slower on cold start, but kicks in
+when the network is bad or Groq is throttled.
 """
 from __future__ import annotations
 
@@ -168,11 +170,28 @@ async def transcribe(
     local_url: str = "",
     local_timeout: float = 8.0,
 ) -> str:
-    """Local-first transcription. Falls back to Groq on any local failure."""
+    """Cloud-first transcription. Falls back to local Whisper if Groq fails."""
+    # Tier 1: Groq cloud Whisper.
+    last_err: TranscriptionError | None = None
+    try:
+        return await _try_groq(audio_bytes, api_key=api_key, filename=filename)
+    except TranscriptionError as exc:
+        logger.warning("Groq Whisper failed (%s); falling back to local", exc)
+        last_err = exc
+
+    # Tier 2: local Whisper on the 3090.
     if local_url:
         text = await _try_local(
             audio_bytes, url=local_url, timeout=local_timeout, filename=filename
         )
         if text is not None:
             return text
-    return await _try_groq(audio_bytes, api_key=api_key, filename=filename)
+        # _try_local already logged the reason it returned None.
+
+    # Nothing worked. Re-raise the most informative error we saw, or a
+    # generic one if even local wasn't configured.
+    if last_err is not None:
+        raise last_err
+    raise TranscriptionError(
+        "No Whisper provider available — set GROQ_API_KEY or LOCAL_WHISPER_URL."
+    )

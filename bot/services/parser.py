@@ -301,14 +301,14 @@ def configure_cascade(
     _GROQ_LLM_MODEL = groq_model or ""
     _TEXT_USE_GEMINI = bool(text_use_gemini)
     text_chain = []
-    if _TEXT_USE_GEMINI:
-        text_chain.append("gemini")
-    if _LOCAL_LLM_URL:
-        text_chain.append(f"local({_LOCAL_LLM_MODEL})")
     if _GROQ_LLM_API_KEY:
         text_chain.append(f"groq({_GROQ_LLM_MODEL})")
+    if _LOCAL_LLM_URL:
+        text_chain.append(f"local({_LOCAL_LLM_MODEL})")
+    if _TEXT_USE_GEMINI:
+        text_chain.append("gemini")
     logger.info(
-        "Parser cascade configured. Text: %s. Audio: gemini-only (multimodal).",
+        "Parser cascade configured. Text: %s. Audio: gemini-multimodal → groq Whisper → local Whisper.",
         " → ".join(text_chain) if text_chain else "(no providers — text parses will fail!)",
     )
 
@@ -615,37 +615,16 @@ _ALL_EXHAUSTED_MSG = (
 async def _text_cascade(message: str, *, api_key: str) -> str:
     """Try tiers in order; return raw text from first one that succeeds.
 
-    Order depends on _TEXT_USE_GEMINI:
-      True  → Gemini (primary) → Local llama → Groq llama
-      False → Local llama (primary) → Groq llama   [Gemini skipped]
-    The False mode preserves Gemini's daily quota for audio-native
-    voice notes where it's the only viable provider.
+    Order (per user pref):
+      Tier 1: Groq llama       — cloud, generous quota, fast
+      Tier 2: Local llama 3090 — offline failsafe, free, slower
+      Tier 3: Gemini           — only if TEXT_USE_GEMINI=true (last resort)
+    The point of Gemini-last: preserve its limited daily quota for the
+    audio-native path where it's the only viable provider.
     """
     failures: list[str] = []
 
-    # Tier 1 (conditional): Gemini — only when explicitly enabled for text.
-    if _TEXT_USE_GEMINI:
-        try:
-            return await _call_gemini([{"text": message}], api_key=api_key)
-        except ParseError as exc:
-            msg = str(exc)
-            failures.append(f"gemini: {msg[:160]}")
-            logger.warning("Cascade: Gemini failed (%s)", msg[:200])
-
-    # Tier 2 (when Gemini skipped) or primary: local Ollama on the 3090.
-    if _LOCAL_LLM_URL:
-        try:
-            logger.info("Cascade: trying local llm (%s)", _LOCAL_LLM_MODEL)
-            return await _call_local_llm(message)
-        except (ParseError, httpx.HTTPError) as exc:
-            msg = str(exc)
-            failures.append(f"local: {msg[:160]}")
-            logger.warning("Cascade: local LLM failed (%s)", msg[:200])
-    elif not _TEXT_USE_GEMINI:
-        # Without Gemini and without local, Groq is the only option.
-        logger.info("Cascade: skipping local llm (not configured)")
-
-    # Tier 3 (final cloud fallback): Groq hosted llama.
+    # Tier 1: Groq hosted llama (different quota pool from Gemini).
     if _GROQ_LLM_API_KEY:
         try:
             logger.info("Cascade: trying groq llm (%s)", _GROQ_LLM_MODEL)
@@ -654,12 +633,27 @@ async def _text_cascade(message: str, *, api_key: str) -> str:
             msg = str(exc)
             failures.append(f"groq: {msg[:160]}")
             logger.warning("Cascade: Groq LLM failed (%s)", msg[:200])
-    else:
-        logger.info("Cascade: skipping groq llm (not configured)")
 
-    # Keep the diagnostic detail in logs (which I can grep when debugging),
-    # but raise a terse user-friendly message — the operator doesn't need
-    # to read "gemini: 429 ...; local: ConnectError ...; groq: ..." in chat.
+    # Tier 2: Local Ollama on the 3090 (offline path).
+    if _LOCAL_LLM_URL:
+        try:
+            logger.info("Cascade: trying local llm (%s)", _LOCAL_LLM_MODEL)
+            return await _call_local_llm(message)
+        except (ParseError, httpx.HTTPError) as exc:
+            msg = str(exc)
+            failures.append(f"local: {msg[:160]}")
+            logger.warning("Cascade: local LLM failed (%s)", msg[:200])
+
+    # Tier 3 (conditional): Gemini as last-resort cloud LLM. Disabled by
+    # default so its limited daily quota is reserved for audio.
+    if _TEXT_USE_GEMINI:
+        try:
+            return await _call_gemini([{"text": message}], api_key=api_key)
+        except ParseError as exc:
+            msg = str(exc)
+            failures.append(f"gemini: {msg[:160]}")
+            logger.warning("Cascade: Gemini failed (%s)", msg[:200])
+
     logger.error("All providers exhausted. tried: %s", "; ".join(failures))
     raise ParseError(_ALL_EXHAUSTED_MSG)
 
