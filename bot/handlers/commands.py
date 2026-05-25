@@ -1136,22 +1136,28 @@ async def _render_report_summary(
     elif prev_entries:
         lines.append(_loan_pair("Last month expense", "—"))
 
-    # TOP MOVERS block
+    # TOP MOVERS block.
+    # 2 lines per mover: label + amount on row 1, name + date on row 2
+    # (indented). This wraps cleanly on a 36-char monospace display where
+    # the previous one-line "label  name amount (date)" format spilled
+    # off the right edge of phone screens.
     top_out = _top_mover(month_entries, side="out")
     top_in = _top_mover(month_entries, side="in")
     if top_out or top_in:
         lines.append("")
         lines.append("TOP MOVERS")
+        # Row-2 width = _LOAN_W - 4-space indent - " · DD/MM" suffix
+        name_w_top = _LOAN_W - 4 - 3 - 5
         if top_out:
             name, mag, d = top_out
             dt = d.strftime("%d/%m") if d else "?"
-            lines.append(_loan_pair("Biggest spend",
-                                    f"{_truncate(name, 18)} {_format_money(mag, cur)} ({dt})"))
+            lines.append(_loan_pair("Biggest spend", _format_money(mag, cur)))
+            lines.append(f"    {_truncate(name, name_w_top)} · {dt}")
         if top_in:
             name, mag, d = top_in
             dt = d.strftime("%d/%m") if d else "?"
-            lines.append(_loan_pair("Biggest income",
-                                    f"{_truncate(name, 18)} {_format_money(mag, cur)} ({dt})"))
+            lines.append(_loan_pair("Biggest income", _format_money(mag, cur)))
+            lines.append(f"    {_truncate(name, name_w_top)} · {dt}")
 
     # CATEGORIES block (expenses only)
     cats = _category_breakdown(month_entries)
