@@ -26,6 +26,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
 
+    user = update.effective_user
+    logger.info(
+        "TEXT_IN user=%s(%s): %r",
+        getattr(user, "first_name", "?"), getattr(user, "id", "?"), message.text,
+    )
+
     try:
         entries = await parse_text(message.text, api_key=settings.gemini_api_key)
     except ParseError as exc:

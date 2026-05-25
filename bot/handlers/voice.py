@@ -48,6 +48,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         filename, gemini_mime = "voice.ogg", "audio/ogg"
 
+    user = update.effective_user
+    logger.info(
+        "VOICE_IN user=%s(%s) mime=%s bytes=%d",
+        getattr(user, "first_name", "?"), getattr(user, "id", "?"),
+        mime_lower or "unknown", len(audio_bytes),
+    )
+
     if settings.use_audio_native_gemini:
         await status.edit_text("🎧 Listening… 🤖 thinking…")
         try:
@@ -74,6 +81,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except TranscriptionError as exc:
         await status.edit_text(f"❌ Transcription failed: {exc}")
         return
+
+    logger.info("VOICE_TRANSCRIPT user=%s: %r", getattr(user, "first_name", "?"), transcript)
 
     await status.edit_text(f"🗣️ \"{transcript}\"\n\n🤖 Thinking…")
 

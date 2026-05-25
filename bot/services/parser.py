@@ -71,11 +71,23 @@ Return ONLY a JSON array, no other text. Each entry MUST have:
 - "category": one of {CATEGORIES}
 - "type": "expense" or "income"
 - "context": short lowercase bucket the money belongs to. If the speaker mentions a specific company, project, person, fund, or label, extract it as a short lowercase string (e.g. "masnoonhub", "wedding fund", "office"). Otherwise omit the field — the bot will default it.
-- "flow": "regular" (default), "loan_taken" (money came in as a loan), or "loan_repaid" (money paid back to settle a loan).
-   - LOAN_TAKEN signals: "borrowed", "took loan", "loan from", "ar dhaar nilam", "loan nilam", "dhaar ane", "loan paisi"
-   - LOAN_REPAID signals: "paid back", "loan repayment", "loan emi", "settled loan", "loan dilam", "dhaar shod korlam", "loan shod"
-   - Pair the flow with the right type: loan_taken → type "income"; loan_repaid → type "expense".
-- "loan_name": OPTIONAL — only when flow is loan_taken or loan_repaid. If the speaker mentions WHO the loan is from/to or WHAT the loan is for (a person's first name, "bike loan", "home loan", "office advance", "bro", "rahim"), extract a short lowercase identifier — one or two words, no spaces (use hyphens). Omit the field if the loan party isn't named.
+- "flow": one of "regular" (default), "loan_taken", "loan_repaid", "loan_given", or "loan_received_back". This is BIDIRECTIONAL — distinguish carefully who borrowed from whom.
+   - LOAN_TAKEN — I borrowed; cash came IN; I now owe them. Signals (EN): "borrowed", "took loan", "loan from <X>", "got a loan". Signals (Banglish): "ar dhaar nilam", "loan nilam", "dhaar ane", "loan paisi", "X theke loan nilam"
+   - LOAN_REPAID — I paid back what I owed; cash went OUT; my debt shrinks. Signals (EN): "paid back", "loan repayment", "loan emi", "settled my loan", "paid off loan". Signals (Banglish): "loan shod korlam", "dhaar shod korlam", "loan shodh dilam"
+   - LOAN_GIVEN — I lent money; cash went OUT; they now owe me. Signals (EN): "lent", "gave loan", "loaned to <X>", "advanced to <X>". Signals (Banglish): "loan dilam", "dhaar dilam", "X ke loan dilam", "ar loan dilam"
+   - LOAN_RECEIVED_BACK — Someone paid me back what they owed me; cash came IN; their debt to me shrinks. Signals (EN): "paid me back", "got my loan back", "they returned my loan". Signals (Banglish): "loan ferot pailam", "amake loan ferot dise", "dhaar ferot pailam"
+   - Pair the flow with the right type:
+       loan_taken → type "income" (cash in)
+       loan_repaid → type "expense" (cash out)
+       loan_given → type "expense" (cash out — you gave money away)
+       loan_received_back → type "income" (cash in — you got money back)
+   - "X dilam" is AMBIGUOUS in Banglish — "loan dilam" = I LENT (loan_given); "loan shod dilam" / "shodh dilam" = I PAID BACK (loan_repaid). Use the surrounding context.
+- "loan_name": STRONGLY PREFERRED whenever flow is loan_taken or loan_repaid. Extract a short lowercase identifier (one or two words, hyphens not spaces) from:
+   * The lender / borrower's first name ("from rahim" → "rahim", "to selim" → "selim")
+   * The loan's purpose ("bike loan" → "bike", "home loan" → "home", "office advance" → "office")
+   * The project or context the loan is for ("loan for masnoonhub" → "masnoonhub")
+   * A relationship word if no name ("bro" → "bro", "abbu" → "abbu", "supplier" → "supplier")
+   Only omit loan_name if the speaker says literally nothing identifying the loan party or purpose. When in doubt, pick the most specific noun in the sentence.
 
 Loan examples:
 
@@ -92,7 +104,19 @@ Input: "bike loan emi 5000"
 Output: [{{"name":"bike loan emi","amount":5000,"category":"Bills","type":"expense","flow":"loan_repaid","loan_name":"bike"}}]
 
 Input: "dosh hajar loan nilam masnoonhub er jonno"
-Output: [{{"name":"loan for masnoonhub","amount":10000,"category":"Other","type":"income","flow":"loan_taken","context":"masnoonhub"}}]
+Output: [{{"name":"loan for masnoonhub","amount":10000,"category":"Other","type":"income","flow":"loan_taken","loan_name":"masnoonhub","context":"masnoonhub"}}]
+
+Input: "lent 1000 to bashar"
+Output: [{{"name":"lent to bashar","amount":1000,"category":"Other","type":"expense","flow":"loan_given","loan_name":"bashar"}}]
+
+Input: "bashar ke 2000 loan dilam"
+Output: [{{"name":"loan to bashar","amount":2000,"category":"Other","type":"expense","flow":"loan_given","loan_name":"bashar"}}]
+
+Input: "bashar paid me back 1000"
+Output: [{{"name":"loan return from bashar","amount":1000,"category":"Other","type":"income","flow":"loan_received_back","loan_name":"bashar"}}]
+
+Input: "rahim theke loan ferot pailam 3000"
+Output: [{{"name":"loan return from rahim","amount":3000,"category":"Other","type":"income","flow":"loan_received_back","loan_name":"rahim"}}]
 
 Examples:
 
@@ -131,7 +155,12 @@ AUDIO_PROMPT = (
     "Listen to this voice note and extract any money movements as described "
     "in the system instructions. The audio may be English, Bengali, or "
     "Banglish (mixed). Be careful to detect whether each entry is an "
-    "expense (money out) or income (money in) based on the verbs used. "
+    "expense (money out) or income (money in) based on the verbs used.\n\n"
+    "CRITICAL: If the audio is silent, contains no speech, contains speech "
+    "but no clear numeric amount, or you cannot confidently understand the "
+    "speaker, return an empty array []. Do NOT invent entries based on the "
+    "examples in the system instructions — those are reference patterns, "
+    "not content to copy. Only emit entries you can hear in THIS audio.\n\n"
     "Return ONLY the JSON array."
 )
 
@@ -243,15 +272,17 @@ def _validate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             entry.get("context"), _CONTEXT_SYNONYMS, _CONTEXT_DEFAULT
         )
         flow_raw = str(entry.get("flow") or "regular").strip().lower()
-        if flow_raw not in ("regular", "loan_taken", "loan_repaid"):
+        if flow_raw not in (
+            "regular", "loan_taken", "loan_repaid", "loan_given", "loan_received_back"
+        ):
             flow_raw = "regular"
-        # Coerce type to match flow — loan_taken is always income,
-        # loan_repaid is always expense. Protects against Gemini emitting
-        # an inconsistent pair.
-        if flow_raw == "loan_taken":
-            kind = "income"
-        elif flow_raw == "loan_repaid":
-            kind = "expense"
+        # Coerce type to match flow — direction is non-negotiable so the
+        # tracker stays internally consistent even if Gemini emits a
+        # mismatched (flow, type) pair.
+        if flow_raw in ("loan_taken", "loan_received_back"):
+            kind = "income"  # cash IN
+        elif flow_raw in ("loan_repaid", "loan_given"):
+            kind = "expense"  # cash OUT
         # Loan name — only meaningful when flow != regular. Normalize to
         # lowercase ascii-ish slug so two phrasings of the same name
         # ("Rahim", "rahim ") collapse to one bucket.

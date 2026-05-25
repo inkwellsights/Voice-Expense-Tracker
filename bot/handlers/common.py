@@ -127,6 +127,10 @@ def format_confirmation(
             suffix_parts.append(f"borrowed ({loan_name})" if loan_name else "borrowed")
         elif flow == "loan_repaid":
             suffix_parts.append(f"repaid ({loan_name})" if loan_name else "repaid")
+        elif flow == "loan_given":
+            suffix_parts.append(f"lent ({loan_name})" if loan_name else "lent")
+        elif flow == "loan_received_back":
+            suffix_parts.append(f"got back ({loan_name})" if loan_name else "got back")
         suffix = (" · " + " · ".join(suffix_parts)) if suffix_parts else ""
         if kind == "income":
             inc_total += amt
@@ -201,8 +205,15 @@ async def log_entries(
             flow_tag = "loan-taken"
         elif flow == "loan_repaid":
             flow_tag = "loan-repaid"
+        elif flow == "loan_given":
+            flow_tag = "loan-given"
+        elif flow == "loan_received_back":
+            flow_tag = "loan-received"
         loan_name = (entry.get("loan_name") or "").strip()
-        loan_name_tag = f"loan:{loan_name}" if (flow_tag and loan_name) else ""
+        # ExpenseOwl strips ':' and '|' from tags (replaces with space).
+        # Hyphen survives, so encode the loan name as `loan--<slug>` and
+        # let cmd_loan parse it back. See _loan_name_from_tags.
+        loan_name_tag = f"loan--{loan_name}" if (flow_tag and loan_name) else ""
         entry_tags = [
             t for t in (tag, entry.get("context") or "", flow_tag, loan_name_tag)
             if t

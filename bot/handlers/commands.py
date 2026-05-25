@@ -67,7 +67,8 @@ def _build_help_text(
             "/today — your spend today (`/today all` for everyone)",
             "/month — your month by category (`/month all` for everyone)",
             "/report — daily ledger for the running month",
-            "/loan — per-loan tracker: taken, repaid, outstanding",
+            "/loan — loan summary (you owe / owed to you / net)",
+            "/loan `<name>` — full history for one counterparty",
             "/categories — list valid categories",
             "/undo — delete your last logged entry",
         ]
@@ -369,20 +370,27 @@ def _daily_row(date_obj, entries: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# /loan — per-loan tracker.
+# /loan — bidirectional per-loan tracker.
 #
-# Reads each entry's tags to bucket it:
-#   • tag 'loan-taken'  → flow="taken"
-#   • tag 'loan-repaid' → flow="repaid"
-#   • tag 'loan:<slug>' → bucket key (else "" = unnamed bucket)
+# Each entry's tags classify it into one of four flow events:
+#   • 'loan-taken'    → I borrowed (cash in, I owe them more)
+#   • 'loan-repaid'   → I paid back (cash out, I owe them less)
+#   • 'loan-given'    → I lent (cash out, they owe me more)
+#   • 'loan-received' → they paid me back (cash in, they owe me less)
 #
-# Per loan, shows totals (taken / repaid / outstanding) and the last
-# few events. Loans are sorted by outstanding descending so anything
-# with money still owed surfaces first; settled loans drop to the
-# bottom. Caller-only by default; `/loan all` aggregates households.
+# Per-loan net = (taken - repaid) - (given - received). Positive = you
+# owe; negative = owed to you; zero = settled.
+#
+# Layout follows Bloomberg/dashboard principles: headline summary at
+# top-left, one compact row per loan (sorted by abs(outstanding) desc),
+# settled loans hidden after SETTLED_LOAN_VISIBLE_DAYS (Splitwise: 30d).
+# `/loan <name>` opens a full-history deep-dive for one counterparty.
 # ---------------------------------------------------------------------------
 
-_LOAN_NAME_TAG_PREFIX = "loan:"
+_LOAN_NAME_TAG_PREFIX = "loan--"
+_LOAN_NAME_LEGACY_PREFIX = "loan "  # entries written before 2026-05-25 used
+                                    # 'loan:<slug>' which ExpenseOwl mangled
+                                    # to 'loan <slug>'. Read both for back-compat.
 
 
 def _loan_name_from_tags(exp: dict[str, Any]) -> str:
@@ -390,36 +398,67 @@ def _loan_name_from_tags(exp: dict[str, Any]) -> str:
         s = str(raw)
         if s.startswith(_LOAN_NAME_TAG_PREFIX):
             return s[len(_LOAN_NAME_TAG_PREFIX):]
+        if s.startswith(_LOAN_NAME_LEGACY_PREFIX) and not s.startswith("loan-"):
+            return s[len(_LOAN_NAME_LEGACY_PREFIX):].strip()
     return ""  # belongs to the unnamed bucket
 
 
 def _classify_loan_entry(exp: dict[str, Any]) -> tuple[str, str, float] | None:
-    """Return (flow, loan_name, magnitude) or None for non-loan entries."""
+    """Return (flow, loan_name, magnitude) or None for non-loan entries.
+
+    flow is one of: "taken", "repaid", "given", "received".
+    """
     tags_lower = {str(t).strip().lower() for t in (exp.get("tags") or [])}
     amt = float(exp.get("amount") or 0)
     if "loan-taken" in tags_lower:
         return "taken", _loan_name_from_tags(exp), abs(amt)
     if "loan-repaid" in tags_lower:
         return "repaid", _loan_name_from_tags(exp), abs(amt)
+    if "loan-given" in tags_lower:
+        return "given", _loan_name_from_tags(exp), abs(amt)
+    if "loan-received" in tags_lower:
+        return "received", _loan_name_from_tags(exp), abs(amt)
     return None
 
 
 def _loan_display_name(slug: str) -> str:
     if not slug:
-        return "(UNNAMED)"
+        return "Unnamed"
     # bike-loan → Bike Loan
-    return slug.replace("-", " ").upper()
+    return slug.replace("-", " ").title()
 
 
-def _format_loan_amount(amount: float, currency: str) -> str:
-    if amount <= 0:
+def _format_money(amount: float, currency: str) -> str:
+    """৳-prefixed integer with commas; '—' for zero/negative-as-empty."""
+    a = abs(float(amount))
+    if not a:
         return "—"
-    return f"{currency}{int(round(amount)):,}"
+    return f"{currency}{int(round(a)):,}"
 
 
-# /loan layout: whitespace-aligned sections separated by horizontal
-# rules. No box-drawing borders — they fragment in some Android
-# monospace fonts (see /report comment above).
+def _relative_time(when: datetime | None, now: datetime) -> str:
+    """Human-readable age. "today", "1d", "2w", "3mo", "1y"."""
+    if when is None:
+        return "?"
+    delta = now - when
+    days = delta.days
+    if days < 0:
+        return "future"
+    if days == 0:
+        return "today"
+    if days == 1:
+        return "1d"
+    if days < 7:
+        return f"{days}d"
+    if days < 30:
+        return f"{days // 7}w"
+    if days < 365:
+        return f"{days // 30}mo"
+    return f"{days // 365}y"
+
+
+# /loan layout: whitespace-aligned. No box-drawing borders — they
+# fragment in some Android monospace fonts (see /report comment above).
 _LOAN_W = _REPORT_W + 1  # 36 — matches /report's visual rhythm
 
 
@@ -432,25 +471,26 @@ def _loan_pair(label: str, value: str, indent: int = 2) -> str:
     return " " * indent + label + " " * gap + value
 
 
-async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = get_settings(context)
-    if not is_authorised(update, context):
-        return
-    try:
-        all_expenses = await _fetch_expenses(context)
-    except ExpenseOwlError as exc:
-        await update.effective_message.reply_text(f"❌ {exc}")
-        return
+# Compact one-line-per-loan row: name | amount-right | last-seen-right.
+_LOAN_LAST_COL = 6
+_LOAN_AMT_COL = 12
+_LOAN_NAME_COL = _LOAN_W - _LOAN_AMT_COL - _LOAN_LAST_COL - 2  # = 16
 
-    show_all = _wants_all_view(context)
-    tag = user_tag(update, settings)
-    own = (
-        all_expenses if show_all
-        else [e for e in all_expenses if expense_has_tag(e, tag)]
+
+def _loan_row(name: str, amount_str: str, last_str: str) -> str:
+    name_t = _truncate(name, _LOAN_NAME_COL)
+    return (
+        f"{name_t:<{_LOAN_NAME_COL}} "
+        f"{amount_str:>{_LOAN_AMT_COL}} "
+        f"{last_str:>{_LOAN_LAST_COL}}"
     )
 
+
+def _build_loan_buckets(
+    own: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
     buckets: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"taken": 0.0, "repaid": 0.0, "events": []}
+        lambda: {"taken": 0.0, "repaid": 0.0, "given": 0.0, "received": 0.0, "events": []}
     )
     for e in own:
         cls = _classify_loan_entry(e)
@@ -460,84 +500,253 @@ async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         b = buckets[name]
         b[flow] += magnitude
         b["events"].append((e, flow, magnitude))
+    return buckets
 
-    cur = settings.currency_symbol
-    scope_name = "everyone" if show_all else tag
+
+def _bucket_net(b: dict[str, Any]) -> float:
+    """Positive = I owe this counterparty; negative = they owe me."""
+    return (b["taken"] - b["repaid"]) - (b["given"] - b["received"])
+
+
+def _bucket_last_event(b: dict[str, Any]) -> datetime | None:
+    when_list = [
+        parse_expense_date(e.get("date")) for (e, _, _) in b["events"]
+    ]
+    when_list = [w for w in when_list if w is not None]
+    if not when_list:
+        return None
+    return max(when_list)
+
+
+async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/loan summary, or /loan <name> for a deep-dive on one counterparty."""
+    settings = get_settings(context)
+    if not is_authorised(update, context):
+        return
+    try:
+        all_expenses = await _fetch_expenses(context)
+    except ExpenseOwlError as exc:
+        await update.effective_message.reply_text(f"❌ {exc}")
+        return
+
+    # Argument parse: 'all' is a scope flag; any other arg is a name filter.
+    args_lower = [a.strip().lower() for a in (getattr(context, "args", None) or [])]
+    show_all = "all" in args_lower
+    name_args = [a for a in args_lower if a != "all"]
+
+    tag = user_tag(update, settings)
+    own = (
+        all_expenses if show_all
+        else [e for e in all_expenses if expense_has_tag(e, tag)]
+    )
+    buckets = _build_loan_buckets(own)
 
     if not buckets:
         prefix = "for everyone" if show_all else f"for {tag}"
         await update.effective_message.reply_text(
             f"No loans tracked {prefix} yet. "
-            f"Say something like \"borrowed 5000 from rahim\" to start tracking."
+            f"Say something like \"borrowed 5000 from rahim\" or "
+            f"\"lent 2000 to bashar\" to start tracking."
         )
         return
 
-    def sort_key(name: str) -> tuple[float, str]:
-        b = buckets[name]
-        outstanding = b["taken"] - b["repaid"]
-        # Active loans first (outstanding > 0), settled at bottom.
-        # Within active, descending by outstanding so the biggest debt is on top.
-        return (-outstanding, name)
-
-    sections: list[str] = [f"🏦 Loans · {scope_name}", ""]
-    total_outstanding = 0.0
-
-    sorted_names = sorted(buckets.keys(), key=sort_key)
-    for idx, name in enumerate(sorted_names):
-        b = buckets[name]
-        outstanding = b["taken"] - b["repaid"]
-        total_outstanding += outstanding
-
-        header_status = (
-            "settled ✓" if outstanding <= 0
-            else f"{cur}{int(round(outstanding)):,} left"
+    if name_args:
+        # Deep-dive on a single counterparty.
+        await _render_loan_detail(
+            update, settings, buckets, query=name_args[0], show_all=show_all,
         )
-        # Per-loan section: NAME line with status right-aligned, then
-        # the three summary rows, then (when present) Recent: + events.
-        # Sections are separated by a full-width horizontal rule —
-        # solid in every font we've seen, unlike box-drawing chars.
-        sections.append(
-            _loan_pair(_loan_display_name(name), f"({header_status})", indent=0)
+        return
+
+    await _render_loan_summary(update, settings, buckets, show_all=show_all, tag=tag)
+
+
+async def _render_loan_summary(
+    update: Update,
+    settings,
+    buckets: dict[str, dict[str, Any]],
+    *,
+    show_all: bool,
+    tag: str,
+) -> None:
+    cur = settings.currency_symbol
+    now = datetime.now(TIMEZONE)
+    cutoff_days = settings.settled_loan_visible_days
+
+    # Net per bucket; classify into owed-by-you, owed-to-you, or settled.
+    items: list[tuple[str, float, datetime | None]] = []
+    you_owe_total = 0.0
+    owed_to_you_total = 0.0
+    settled_recent: list[tuple[str, datetime | None]] = []
+    settled_hidden = 0
+
+    for name, b in buckets.items():
+        net = _bucket_net(b)
+        last = _bucket_last_event(b)
+        if abs(net) < 0.5:  # treat sub-rupee residue as settled
+            if last is None or cutoff_days <= 0 or (now - last).days <= cutoff_days:
+                settled_recent.append((name, last))
+            else:
+                settled_hidden += 1
+            continue
+        items.append((name, net, last))
+        if net > 0:
+            you_owe_total += net
+        else:
+            owed_to_you_total += -net
+
+    # Sort by absolute outstanding, biggest first.
+    items.sort(key=lambda x: (-abs(x[1]), x[0]))
+    owe_items = [(n, v, l) for (n, v, l) in items if v > 0]
+    owed_items = [(n, v, l) for (n, v, l) in items if v < 0]
+
+    scope_name = "everyone" if show_all else tag
+    stamp = now.strftime("%d/%m %H:%M")
+    net_total = you_owe_total - owed_to_you_total
+
+    lines: list[str] = [f"🏦 LOANS · {scope_name} · as of {stamp}", ""]
+    lines.append(_loan_pair("You owe", _format_money(you_owe_total, cur), indent=0))
+    lines.append(_loan_pair("Owed to you", _format_money(owed_to_you_total, cur), indent=0))
+    # Net from your perspective: positive net_total = you owe more than
+    # you're owed → render negative ("you're down ৳X"). Negative = the
+    # opposite ("you're up ৳X").
+    if net_total > 0:
+        net_value = "-" + _format_money(net_total, cur)
+    elif net_total < 0:
+        net_value = "+" + _format_money(net_total, cur)
+    else:
+        net_value = "—"
+    lines.append(_loan_pair("Net", net_value, indent=0))
+    lines.append("")
+    counts = f"Active {len(items)}"
+    if settled_recent:
+        counts += f" · Settled (last {cutoff_days}d) {len(settled_recent)}"
+    if settled_hidden:
+        counts += f" · {settled_hidden} older settled hidden"
+    lines.append(counts)
+
+    def section(title: str, rows: list[tuple[str, float, datetime | None]]) -> None:
+        if not rows:
+            return
+        lines.append("")
+        lines.append("─" * _LOAN_W)
+        lines.append(f"{title:<{_LOAN_NAME_COL}} {'Amount':>{_LOAN_AMT_COL}} {'Last':>{_LOAN_LAST_COL}}")
+        lines.append("─" * _LOAN_W)
+        for name, net, last in rows:
+            lines.append(_loan_row(
+                _loan_display_name(name),
+                _format_money(net, cur),
+                _relative_time(last, now),
+            ))
+
+    section("YOU OWE", owe_items)
+    section("OWED TO YOU", owed_items)
+
+    if settled_recent:
+        lines.append("")
+        lines.append("─" * _LOAN_W)
+        names = ", ".join(_loan_display_name(n) for n, _ in settled_recent)
+        lines.append(f"Settled (last {cutoff_days}d): {names}")
+
+    if items:
+        lines.append("")
+        lines.append("/loan <name>  for full history")
+
+    body = "\n".join(lines).rstrip()
+    await update.effective_message.reply_html(f"<pre>{html.escape(body)}</pre>")
+
+
+async def _render_loan_detail(
+    update: Update,
+    settings,
+    buckets: dict[str, dict[str, Any]],
+    *,
+    query: str,
+    show_all: bool,
+) -> None:
+    """Single-loan view: full history, all four totals, dates."""
+    cur = settings.currency_symbol
+    now = datetime.now(TIMEZONE)
+
+    # Resolve query → bucket key. Match against slug AND display name
+    # case-insensitively. Prefix match falls through to exact.
+    q = query.strip().lower()
+    matches: list[str] = []
+    for slug in buckets.keys():
+        display_lower = _loan_display_name(slug).lower()
+        if slug.lower() == q or display_lower == q:
+            matches = [slug]
+            break
+        if slug.lower().startswith(q) or display_lower.startswith(q):
+            matches.append(slug)
+    if not matches:
+        avail = ", ".join(sorted(_loan_display_name(k) for k in buckets.keys()))
+        await update.effective_message.reply_text(
+            f"No loan matches '{query}'. Known: {avail}"
         )
-        sections.append(_loan_pair("Taken", f"{cur}{int(round(b['taken'])):,}"))
-        sections.append(_loan_pair("Repaid", f"{cur}{int(round(b['repaid'])):,}"))
-        sections.append(_loan_pair("Out", _format_loan_amount(outstanding, cur)))
+        return
+    if len(matches) > 1:
+        await update.effective_message.reply_text(
+            f"'{query}' matches multiple: "
+            f"{', '.join(_loan_display_name(m) for m in matches)}. "
+            f"Be more specific."
+        )
+        return
 
-        # Recent events, oldest first within the last-5 window so the
-        # ledger reads naturally top-to-bottom in chronological order.
-        events_by_date = sorted(
-            b["events"],
-            key=lambda x: parse_expense_date(x[0].get("date")) or datetime.min.replace(tzinfo=TIMEZONE),
-            reverse=True,
-        )[:5]
-        if events_by_date:
-            sections.append("  Recent:")
-            # date(5) + 2-space + desc + 1-space + amount(8) ≤ available width
-            available = _LOAN_W - 4  # 4-space indent inside Recent:
-            desc_w = available - 5 - 2 - 1 - 8
-            for e, flow, magnitude in reversed(events_by_date):
-                d = _entry_local_date(e)
-                date_str = d.strftime("%d/%m") if d else "?"
-                sign = "+" if flow == "taken" else "−"
-                desc = _truncate(str(e.get("name") or "?"), desc_w)
-                amount_str = f"{sign}{int(round(magnitude)):,}"
-                sections.append(
-                    f"    {date_str}  {desc:<{desc_w}} {amount_str:>8}"
-                )
-
-        # Divider between loan blocks (but not after the last one).
-        if idx != len(sorted_names) - 1:
-            sections.append("")
-            sections.append("─" * _LOAN_W)
-            sections.append("")
-
-    sections.append("")
-    sections.append("─" * _LOAN_W)
-    sections.append(
-        f"TOTAL OUTSTANDING: {cur}{int(round(total_outstanding)):,}"
+    name = matches[0]
+    b = buckets[name]
+    net = _bucket_net(b)
+    last = _bucket_last_event(b)
+    events_sorted = sorted(
+        b["events"],
+        key=lambda x: parse_expense_date(x[0].get("date")) or datetime.min.replace(tzinfo=TIMEZONE),
+    )
+    first_event = (
+        parse_expense_date(events_sorted[0][0].get("date")) if events_sorted else None
     )
 
-    body = "\n".join(sections).rstrip()
+    lines: list[str] = [
+        f"🏦 {_loan_display_name(name).upper()} · {now.strftime('%d/%m %H:%M')}",
+        "",
+    ]
+    if abs(net) < 0.5:
+        status_value = "settled ✓"
+    elif net > 0:
+        status_value = f"you owe {_format_money(net, cur)}"
+    else:
+        status_value = f"{_loan_display_name(name)} owes you {_format_money(net, cur)}"
+    lines.append(_loan_pair("Status", status_value, indent=0))
+    lines.append(_loan_pair("First event", _relative_time(first_event, now), indent=0))
+    lines.append(_loan_pair("Last event", _relative_time(last, now), indent=0))
+    lines.append(_loan_pair("Events", str(len(b["events"])), indent=0))
+    lines.append("")
+    # Show only non-zero rows so the panel stays clean for one-sided loans.
+    if b["taken"]:
+        lines.append(_loan_pair("Taken (I borrowed)", _format_money(b["taken"], cur), indent=0))
+    if b["repaid"]:
+        lines.append(_loan_pair("Repaid (I paid back)", _format_money(b["repaid"], cur), indent=0))
+    if b["given"]:
+        lines.append(_loan_pair("Given (I lent)", _format_money(b["given"], cur), indent=0))
+    if b["received"]:
+        lines.append(_loan_pair("Received (paid back)", _format_money(b["received"], cur), indent=0))
+
+    lines.append("")
+    lines.append("─" * _LOAN_W)
+    lines.append("History")
+    lines.append("─" * _LOAN_W)
+    # Compact event rows: date | desc | signed-amount
+    avail = _LOAN_W - 5 - 2 - 1 - 9  # date(5)+gap(2)+space(1)+amount(9)
+    sign_map = {"taken": "+", "received": "+", "repaid": "-", "given": "-"}
+    for e, flow, magnitude in events_sorted:
+        d = _entry_local_date(e)
+        date_str = d.strftime("%d/%m") if d else "?"
+        desc = _truncate(str(e.get("name") or "?"), avail)
+        amt = f"{sign_map.get(flow, '?')}{int(round(magnitude)):,}"
+        lines.append(f"{date_str}  {desc:<{avail}} {amt:>9}")
+
+    lines.append("")
+    lines.append("/loan  for summary")
+
+    body = "\n".join(lines).rstrip()
     await update.effective_message.reply_html(f"<pre>{html.escape(body)}</pre>")
 
 

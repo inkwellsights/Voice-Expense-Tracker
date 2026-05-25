@@ -64,6 +64,11 @@ class Settings:
     # timeout / 5xx the cloud Groq path runs instead. Empty = cloud-only.
     local_whisper_url: str = ""
     local_whisper_timeout: float = 8.0
+    # /loan auto-hides settled loans that haven't seen any event in this
+    # many days. Splitwise uses 30. Set to 0 to never hide. The entries
+    # are never deleted — they remain in ExpenseOwl, /report, dashboard,
+    # and the /loan <name> deep-dive.
+    settled_loan_visible_days: int = 30
 
 
 def _require(name: str) -> str:
@@ -189,5 +194,8 @@ def load_settings() -> Settings:
         local_whisper_url=os.getenv("LOCAL_WHISPER_URL", "").strip().rstrip("/"),
         local_whisper_timeout=float(
             os.getenv("LOCAL_WHISPER_TIMEOUT_SECONDS", "8") or 8
+        ),
+        settled_loan_visible_days=int(
+            os.getenv("SETTLED_LOAN_VISIBLE_DAYS", "30") or 30
         ),
     )
