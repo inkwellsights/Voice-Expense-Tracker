@@ -49,6 +49,10 @@ _LOCAL_LLM_MODEL: str = ""
 _LOCAL_LLM_TIMEOUT: float = 30.0
 _GROQ_LLM_API_KEY: str = ""
 _GROQ_LLM_MODEL: str = ""
+# When False, _text_cascade skips Gemini entirely — text parses run
+# local llama -> Groq llama. Default-off so Gemini's daily quota is
+# preserved for audio-native voice notes (where only it can read audio).
+_TEXT_USE_GEMINI: bool = False
 GROQ_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 SYSTEM_PROMPT = f"""You are a cash-flow parser. Extract money-movement entries from the user's input (which may be text, a speech-to-text transcript, or raw audio).
@@ -272,6 +276,7 @@ def configure_cascade(
     local_timeout: float = 30.0,
     groq_api_key: str = "",
     groq_model: str = "",
+    text_use_gemini: bool = False,
 ) -> None:
     """Wire the cross-provider parser fallback chain at startup.
 
@@ -281,18 +286,30 @@ def configure_cascade(
     (parse_text); multimodal Gemini calls (parse_image / parse_audio)
     have no llama fallback because the open-weight models on those
     tiers are text-only.
+
+    When `text_use_gemini=False` (the default), Gemini is dropped from
+    the text cascade entirely — text routes local → Groq → fail. The
+    point: save Gemini's daily quota for audio-native voice notes,
+    where it's the only path with multimodal capability.
     """
     global _LOCAL_LLM_URL, _LOCAL_LLM_MODEL, _LOCAL_LLM_TIMEOUT
-    global _GROQ_LLM_API_KEY, _GROQ_LLM_MODEL
+    global _GROQ_LLM_API_KEY, _GROQ_LLM_MODEL, _TEXT_USE_GEMINI
     _LOCAL_LLM_URL = (local_url or "").rstrip("/")
     _LOCAL_LLM_MODEL = local_model or ""
     _LOCAL_LLM_TIMEOUT = float(local_timeout or 30.0)
     _GROQ_LLM_API_KEY = groq_api_key or ""
     _GROQ_LLM_MODEL = groq_model or ""
+    _TEXT_USE_GEMINI = bool(text_use_gemini)
+    text_chain = []
+    if _TEXT_USE_GEMINI:
+        text_chain.append("gemini")
+    if _LOCAL_LLM_URL:
+        text_chain.append(f"local({_LOCAL_LLM_MODEL})")
+    if _GROQ_LLM_API_KEY:
+        text_chain.append(f"groq({_GROQ_LLM_MODEL})")
     logger.info(
-        "Parser cascade configured: gemini → %s → %s",
-        f"local({_LOCAL_LLM_MODEL}@{_LOCAL_LLM_URL})" if _LOCAL_LLM_URL else "(no local)",
-        f"groq({_GROQ_LLM_MODEL})" if _GROQ_LLM_API_KEY else "(no groq)",
+        "Parser cascade configured. Text: %s. Audio: gemini-only (multimodal).",
+        " → ".join(text_chain) if text_chain else "(no providers — text parses will fail!)",
     )
 
 
@@ -597,18 +614,26 @@ _ALL_EXHAUSTED_MSG = (
 
 
 async def _text_cascade(message: str, *, api_key: str) -> str:
-    """Gemini → Local LLM → Groq LLM. Return raw text from first tier that succeeds."""
+    """Try tiers in order; return raw text from first one that succeeds.
+
+    Order depends on _TEXT_USE_GEMINI:
+      True  → Gemini (primary) → Local llama → Groq llama
+      False → Local llama (primary) → Groq llama   [Gemini skipped]
+    The False mode preserves Gemini's daily quota for audio-native
+    voice notes where it's the only viable provider.
+    """
     failures: list[str] = []
 
-    # Tier 1: Gemini (preferred — JSON-mode, large context, multimodal-capable)
-    try:
-        return await _call_gemini([{"text": message}], api_key=api_key)
-    except ParseError as exc:
-        msg = str(exc)
-        failures.append(f"gemini: {msg[:160]}")
-        logger.warning("Cascade: Gemini failed (%s)", msg[:200])
+    # Tier 1 (conditional): Gemini — only when explicitly enabled for text.
+    if _TEXT_USE_GEMINI:
+        try:
+            return await _call_gemini([{"text": message}], api_key=api_key)
+        except ParseError as exc:
+            msg = str(exc)
+            failures.append(f"gemini: {msg[:160]}")
+            logger.warning("Cascade: Gemini failed (%s)", msg[:200])
 
-    # Tier 2: Local Ollama on the 3090 (offline path)
+    # Tier 2 (when Gemini skipped) or primary: local Ollama on the 3090.
     if _LOCAL_LLM_URL:
         try:
             logger.info("Cascade: trying local llm (%s)", _LOCAL_LLM_MODEL)
@@ -617,10 +642,11 @@ async def _text_cascade(message: str, *, api_key: str) -> str:
             msg = str(exc)
             failures.append(f"local: {msg[:160]}")
             logger.warning("Cascade: local LLM failed (%s)", msg[:200])
-    else:
+    elif not _TEXT_USE_GEMINI:
+        # Without Gemini and without local, Groq is the only option.
         logger.info("Cascade: skipping local llm (not configured)")
 
-    # Tier 3: Groq hosted llama (different provider, different quota)
+    # Tier 3 (final cloud fallback): Groq hosted llama.
     if _GROQ_LLM_API_KEY:
         try:
             logger.info("Cascade: trying groq llm (%s)", _GROQ_LLM_MODEL)

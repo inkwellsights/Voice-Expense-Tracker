@@ -50,6 +50,12 @@ class Settings:
     # API call, no Whisper. Falls back to Whisper+Gemini-text on failure.
     # Flip to false in .env to revert to the Whisper-first pipeline.
     use_audio_native_gemini: bool = True
+    # If true, text/transcript parses include Gemini as the primary tier
+    # of the cascade. If false, text skips Gemini entirely and routes to
+    # local llama (3090) -> Groq llama (cloud). The point of false: save
+    # Gemini's daily quota for audio-native voice notes (where only it
+    # can read audio), since local/Groq llamas handle text fine.
+    text_use_gemini: bool = False
     # Second tag attached to every logged entry alongside the user tag.
     # Canonical name when nothing specific is mentioned in the input
     # (e.g. "personal").
@@ -229,6 +235,9 @@ def load_settings() -> Settings:
         user_tags=_parse_user_tags(),
         use_audio_native_gemini=_parse_bool(
             os.getenv("USE_AUDIO_NATIVE_GEMINI"), default=True
+        ),
+        text_use_gemini=_parse_bool(
+            os.getenv("TEXT_USE_GEMINI"), default=False
         ),
         context_default=(os.getenv("TAG_DEFAULT", "personal").strip() or "personal"),
         context_synonyms=_parse_context_synonyms(),

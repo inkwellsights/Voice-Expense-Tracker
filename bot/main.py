@@ -88,6 +88,7 @@ def build_application() -> Application:
         local_timeout=settings.local_llm_timeout,
         groq_api_key=settings.groq_api_key,  # reuses the Whisper key
         groq_model=settings.groq_llm_model,
+        text_use_gemini=settings.text_use_gemini,
     )
 
     application.bot_data["settings"] = settings
