@@ -64,6 +64,13 @@ class Settings:
     # timeout / 5xx the cloud Groq path runs instead. Empty = cloud-only.
     local_whisper_url: str = ""
     local_whisper_timeout: float = 8.0
+    # Cross-provider parser fallback (text/transcript only). When Gemini
+    # 429s, parser cascades: Gemini → local Ollama → Groq llama. Empty
+    # values disable that tier. See parser.configure_cascade.
+    local_llm_url: str = ""
+    local_llm_model: str = "llama3.1:8b-instruct-q4_K_M"
+    local_llm_timeout: float = 30.0
+    groq_llm_model: str = "llama-3.3-70b-versatile"
     # /loan auto-hides settled loans that haven't seen any event in this
     # many days. Splitwise uses 30. Set to 0 to never hide. The entries
     # are never deleted — they remain in ExpenseOwl, /report, dashboard,
@@ -194,6 +201,18 @@ def load_settings() -> Settings:
         local_whisper_url=os.getenv("LOCAL_WHISPER_URL", "").strip().rstrip("/"),
         local_whisper_timeout=float(
             os.getenv("LOCAL_WHISPER_TIMEOUT_SECONDS", "8") or 8
+        ),
+        local_llm_url=os.getenv("LOCAL_LLM_URL", "").strip().rstrip("/"),
+        local_llm_model=(
+            os.getenv("LOCAL_LLM_MODEL", "llama3.1:8b-instruct-q4_K_M").strip()
+            or "llama3.1:8b-instruct-q4_K_M"
+        ),
+        local_llm_timeout=float(
+            os.getenv("LOCAL_LLM_TIMEOUT_SECONDS", "30") or 30
+        ),
+        groq_llm_model=(
+            os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile").strip()
+            or "llama-3.3-70b-versatile"
         ),
         settled_loan_visible_days=int(
             os.getenv("SETTLED_LOAN_VISIBLE_DAYS", "30") or 30

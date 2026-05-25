@@ -79,9 +79,16 @@ async def _try_local(
 ) -> str | None:
     """Try the local Whisper server. Returns text on success, None on fallthrough.
 
-    LowConfidenceTranscript bubbles up (it's a real transcript that failed the
-    guard — no point asking the cloud the same question). Everything else
-    (transport errors, 503, 5xx) returns None so the caller hits Groq.
+    Returns None for ANY failure mode so the caller falls through to Groq:
+      - transport / connect / timeout errors
+      - 503 (GPU-busy gate)
+      - 5xx server errors
+      - LowConfidenceTranscript — local large-v3 can be conservative on
+        short Banglish clips where cloud large-v3 is fine, so a second
+        opinion is worth one round trip. If cloud ALSO returns low
+        confidence, that error then bubbles up to the user.
+    4xx (other than 503) raises — that means we sent something wrong and
+    the cloud will reject identically.
     """
     files = {
         "file": (filename, audio_bytes, "audio/ogg"),
@@ -111,7 +118,12 @@ async def _try_local(
         raise TranscriptionError(
             f"Local Whisper returned {response.status_code}: {response.text[:300]}"
         )
-    return _extract_text(response.json(), source="local")
+    try:
+        return _extract_text(response.json(), source="local")
+    except LowConfidenceTranscript as exc:
+        # Worth asking cloud — different model weights / detector tuning.
+        logger.info("local low-confidence (%s); falling back to Groq cloud", exc)
+        return None
 
 
 async def _try_groq(

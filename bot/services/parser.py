@@ -1,7 +1,13 @@
-"""Gemini Flash expense parser.
+"""Multi-provider expense parser with cross-provider cascade.
 
-Handles both plain text and receipt images. Free tier: 15 RPM / 1M tokens per day.
-Input may be Bengali, English, or Banglish — extract the numeric amount regardless.
+Primary: Gemini (2.5-flash-lite → 2.5-flash). Handles text, image, audio.
+Fallback A (text/transcript only): local Ollama on the 3090 (offline).
+Fallback B (text/transcript only): Groq's hosted llama-3.3-70b-versatile.
+
+Multimodal inputs (audio, image) only use Gemini — the fallback llamas
+are text-only. When a voice note's audio-native Gemini call fails, the
+voice handler falls through to Whisper + parse_text, which then has
+the full three-tier cascade.
 
 Context tags: each entry also carries a 'context' (e.g. 'personal',
 'MHUBEXP') derived from what the speaker mentions. The synonym table
@@ -35,6 +41,15 @@ MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
 GEMINI_URL_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 )
+
+# Cross-provider fallback config (text-only parses). Configured at startup
+# by main.py via configure_cascade(...). Empty values disable that tier.
+_LOCAL_LLM_URL: str = ""
+_LOCAL_LLM_MODEL: str = ""
+_LOCAL_LLM_TIMEOUT: float = 30.0
+_GROQ_LLM_API_KEY: str = ""
+_GROQ_LLM_MODEL: str = ""
+GROQ_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 SYSTEM_PROMPT = f"""You are a cash-flow parser. Extract money-movement entries from the user's input (which may be text, a speech-to-text transcript, or raw audio).
 Input may be English, Bengali (Bangla), or Banglish (mixed). Transcripts may have spelling errors.
@@ -188,6 +203,37 @@ def _extract_json_array(raw: str) -> list[dict[str, Any]]:
     if not isinstance(parsed, list):
         raise ParseError(f"Gemini did not return a JSON array: {raw[:300]}")
     return parsed
+
+
+def configure_cascade(
+    *,
+    local_url: str = "",
+    local_model: str = "",
+    local_timeout: float = 30.0,
+    groq_api_key: str = "",
+    groq_model: str = "",
+) -> None:
+    """Wire the cross-provider parser fallback chain at startup.
+
+    Called once from main.py. Empty values disable that tier — e.g. no
+    local_url means the bot skips straight from Gemini to Groq llama on
+    Gemini failure. The fallbacks only apply to TEXT/TRANSCRIPT parses
+    (parse_text); multimodal Gemini calls (parse_image / parse_audio)
+    have no llama fallback because the open-weight models on those
+    tiers are text-only.
+    """
+    global _LOCAL_LLM_URL, _LOCAL_LLM_MODEL, _LOCAL_LLM_TIMEOUT
+    global _GROQ_LLM_API_KEY, _GROQ_LLM_MODEL
+    _LOCAL_LLM_URL = (local_url or "").rstrip("/")
+    _LOCAL_LLM_MODEL = local_model or ""
+    _LOCAL_LLM_TIMEOUT = float(local_timeout or 30.0)
+    _GROQ_LLM_API_KEY = groq_api_key or ""
+    _GROQ_LLM_MODEL = groq_model or ""
+    logger.info(
+        "Parser cascade configured: gemini → %s → %s",
+        f"local({_LOCAL_LLM_MODEL}@{_LOCAL_LLM_URL})" if _LOCAL_LLM_URL else "(no local)",
+        f"groq({_GROQ_LLM_MODEL})" if _GROQ_LLM_API_KEY else "(no groq)",
+    )
 
 
 def configure_context(synonyms: dict[str, list[str]], default: str) -> None:
@@ -406,9 +452,128 @@ async def _call_gemini(parts: list[dict[str, Any]], *, api_key: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible fallback providers.
+#
+# Both local Ollama and Groq's hosted llamas speak the OpenAI chat-completions
+# wire format, so one client function serves both. We send the same Gemini
+# system prompt verbatim — it's provider-agnostic JSON instructions. The
+# response_format=json_object hint nudges the model to wrap output as a JSON
+# object; _extract_json_array still finds the array inside via regex.
+# ---------------------------------------------------------------------------
+
+
+async def _call_openai_compat(
+    url: str, *, api_key: str | None, model: str, message: str, timeout: float
+) -> str:
+    prompt = SYSTEM_PROMPT
+    if _CONTEXT_BLOCK:
+        prompt = prompt + "\n\n" + _CONTEXT_BLOCK
+    # Ask the fallback to wrap its array under a stable key so json_object
+    # mode is happy. _extract_json_array peels the array back out.
+    user_msg = (
+        f"{message}\n\n"
+        f"Return a JSON object of the form {{\"entries\": [...]}} where the "
+        f"array elements follow the schema in the system instructions."
+    )
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(url, headers=headers, json=body)
+    if response.status_code != 200:
+        raise ParseError(
+            f"{model} via {url} returned {response.status_code}: {response.text[:300]}"
+        )
+    data = response.json()
+    choices = data.get("choices") or []
+    if not choices:
+        raise ParseError(f"{model} returned no choices: {response.text[:300]}")
+    content = (choices[0].get("message", {}) or {}).get("content", "") or ""
+    if not content.strip():
+        raise ParseError(f"{model} returned empty content")
+    logger.info("Fallback %s raw: %s", model, content[:600])
+    return content
+
+
+async def _call_local_llm(message: str) -> str:
+    if not _LOCAL_LLM_URL or not _LOCAL_LLM_MODEL:
+        raise ParseError("local llm not configured")
+    return await _call_openai_compat(
+        _LOCAL_LLM_URL, api_key=None, model=_LOCAL_LLM_MODEL,
+        message=message, timeout=_LOCAL_LLM_TIMEOUT,
+    )
+
+
+async def _call_groq_llm(message: str) -> str:
+    if not _GROQ_LLM_API_KEY or not _GROQ_LLM_MODEL:
+        raise ParseError("groq llm not configured")
+    return await _call_openai_compat(
+        GROQ_LLM_URL, api_key=_GROQ_LLM_API_KEY, model=_GROQ_LLM_MODEL,
+        message=message, timeout=30.0,
+    )
+
+
+_ALL_EXHAUSTED_MSG = (
+    "All AI providers are currently throttled or unavailable. "
+    "Please try again in a few minutes."
+)
+
+
+async def _text_cascade(message: str, *, api_key: str) -> str:
+    """Gemini → Local LLM → Groq LLM. Return raw text from first tier that succeeds."""
+    failures: list[str] = []
+
+    # Tier 1: Gemini (preferred — JSON-mode, large context, multimodal-capable)
+    try:
+        return await _call_gemini([{"text": message}], api_key=api_key)
+    except ParseError as exc:
+        msg = str(exc)
+        failures.append(f"gemini: {msg[:160]}")
+        logger.warning("Cascade: Gemini failed (%s)", msg[:200])
+
+    # Tier 2: Local Ollama on the 3090 (offline path)
+    if _LOCAL_LLM_URL:
+        try:
+            logger.info("Cascade: trying local llm (%s)", _LOCAL_LLM_MODEL)
+            return await _call_local_llm(message)
+        except (ParseError, httpx.HTTPError) as exc:
+            msg = str(exc)
+            failures.append(f"local: {msg[:160]}")
+            logger.warning("Cascade: local LLM failed (%s)", msg[:200])
+    else:
+        logger.info("Cascade: skipping local llm (not configured)")
+
+    # Tier 3: Groq hosted llama (different provider, different quota)
+    if _GROQ_LLM_API_KEY:
+        try:
+            logger.info("Cascade: trying groq llm (%s)", _GROQ_LLM_MODEL)
+            return await _call_groq_llm(message)
+        except (ParseError, httpx.HTTPError) as exc:
+            msg = str(exc)
+            failures.append(f"groq: {msg[:160]}")
+            logger.warning("Cascade: Groq LLM failed (%s)", msg[:200])
+    else:
+        logger.info("Cascade: skipping groq llm (not configured)")
+
+    raise ParseError(f"{_ALL_EXHAUSTED_MSG} (tried: {'; '.join(failures)})")
+
+
 async def parse_text(message: str, *, api_key: str) -> list[dict[str, Any]]:
-    """Parse an expense (or many) from a text/transcript string."""
-    raw = await _call_gemini([{"text": message}], api_key=api_key)
+    """Parse an expense (or many) from a text/transcript string.
+
+    Uses the three-tier cross-provider cascade (see _text_cascade).
+    """
+    raw = await _text_cascade(message, api_key=api_key)
     return _validate(_extract_json_array(raw))
 
 

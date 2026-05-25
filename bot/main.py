@@ -75,6 +75,17 @@ def build_application() -> Application:
     parser_service.configure_context(
         settings.context_synonyms, settings.context_default
     )
+    # Cross-provider parser fallback for text/transcript parses. Gemini
+    # stays primary; local Ollama on the 3090 is tried when Gemini fails;
+    # Groq's hosted llama is the cloud safety net. Empty fields disable
+    # that tier — see .env LOCAL_LLM_URL / GROQ_LLM_MODEL.
+    parser_service.configure_cascade(
+        local_url=settings.local_llm_url,
+        local_model=settings.local_llm_model,
+        local_timeout=settings.local_llm_timeout,
+        groq_api_key=settings.groq_api_key,  # reuses the Whisper key
+        groq_model=settings.groq_llm_model,
+    )
 
     application.bot_data["settings"] = settings
     application.bot_data["owl"] = ExpenseOwl(settings.expenseowl_url)
