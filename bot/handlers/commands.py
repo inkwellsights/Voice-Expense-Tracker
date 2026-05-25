@@ -4,7 +4,7 @@ from __future__ import annotations
 import html
 import logging
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from telegram import Update
@@ -16,6 +16,7 @@ from .common import (
     expense_has_tag,
     format_amount,
     get_allowlist,
+    get_loan_aliases,
     get_owl,
     get_settings,
     is_admin,
@@ -69,6 +70,9 @@ def _build_help_text(
             "/report — daily ledger for the running month",
             "/loan — loan summary (you owe / owed to you / net)",
             "/loan `<name>` — full history for one counterparty",
+            "/loan merge `<from>` `<to>` — collapse mistranscribed names "
+            "(e.g. `/loan merge ikbal iqbal`)",
+            "/loan aliases — list active merges",
             "/categories — list valid categories",
             "/undo — delete your last logged entry",
         ]
@@ -270,16 +274,24 @@ async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 #                        considered loan-funded until the loan is exhausted.
 # ---------------------------------------------------------------------------
 
-_REPORT_BUCKETS = ("regular_income", "regular_expense", "loan_taken", "loan_repaid")
+_REPORT_BUCKETS = (
+    "regular_income", "regular_expense",
+    "loan_taken", "loan_repaid", "loan_given", "loan_received",
+)
 
 
 def _classify_entry(exp: dict[str, Any]) -> tuple[str, float]:
+    """Classify entry into one of _REPORT_BUCKETS by tag, fallback to sign."""
     tags_lower = {str(t).strip().lower() for t in (exp.get("tags") or [])}
     amt = float(exp.get("amount") or 0)
     if "loan-taken" in tags_lower:
         return "loan_taken", abs(amt)
     if "loan-repaid" in tags_lower:
         return "loan_repaid", abs(amt)
+    if "loan-given" in tags_lower:
+        return "loan_given", abs(amt)
+    if "loan-received" in tags_lower:
+        return "loan_received", abs(amt)
     if amt > 0:
         return "regular_income", amt
     if amt < 0:
@@ -488,7 +500,15 @@ def _loan_row(name: str, amount_str: str, last_str: str) -> str:
 
 def _build_loan_buckets(
     own: list[dict[str, Any]],
+    *,
+    aliases=None,
 ) -> dict[str, dict[str, Any]]:
+    """Bucket entries by canonical loan name.
+
+    When `aliases` is provided, the bucket key is `aliases.canonical(name)`
+    so legacy entries written before an alias was set still collapse into
+    the canonical bucket on read.
+    """
     buckets: dict[str, dict[str, Any]] = defaultdict(
         lambda: {"taken": 0.0, "repaid": 0.0, "given": 0.0, "received": 0.0, "events": []}
     )
@@ -497,6 +517,8 @@ def _build_loan_buckets(
         if not cls:
             continue
         flow, name, magnitude = cls
+        if aliases is not None and name:
+            name = aliases.canonical(name)
         b = buckets[name]
         b[flow] += magnitude
         b["events"].append((e, flow, magnitude))
@@ -519,18 +541,38 @@ def _bucket_last_event(b: dict[str, Any]) -> datetime | None:
 
 
 async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/loan summary, or /loan <name> for a deep-dive on one counterparty."""
+    """/loan dispatcher:
+      /loan                       summary view
+      /loan all                   household scope
+      /loan <name> [all]          deep-dive on one counterparty
+      /loan merge <from> <to>     merge two loan buckets + persist alias
+      /loan unmerge <name>        remove an existing alias
+      /loan aliases               list current alias map
+    """
     settings = get_settings(context)
     if not is_authorised(update, context):
         return
+
+    args_lower = [a.strip().lower() for a in (getattr(context, "args", None) or [])]
+
+    # Subcommand dispatch — handle these before fetching expenses so the
+    # admin paths stay snappy.
+    if args_lower and args_lower[0] == "merge":
+        await _cmd_loan_merge(update, context, args_lower[1:])
+        return
+    if args_lower and args_lower[0] == "unmerge":
+        await _cmd_loan_unmerge(update, context, args_lower[1:])
+        return
+    if args_lower and args_lower[0] == "aliases":
+        await _cmd_loan_aliases(update, context)
+        return
+
     try:
         all_expenses = await _fetch_expenses(context)
     except ExpenseOwlError as exc:
         await update.effective_message.reply_text(f"❌ {exc}")
         return
 
-    # Argument parse: 'all' is a scope flag; any other arg is a name filter.
-    args_lower = [a.strip().lower() for a in (getattr(context, "args", None) or [])]
     show_all = "all" in args_lower
     name_args = [a for a in args_lower if a != "all"]
 
@@ -539,7 +581,8 @@ async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         all_expenses if show_all
         else [e for e in all_expenses if expense_has_tag(e, tag)]
     )
-    buckets = _build_loan_buckets(own)
+    aliases = get_loan_aliases(context)
+    buckets = _build_loan_buckets(own, aliases=aliases)
 
     if not buckets:
         prefix = "for everyone" if show_all else f"for {tag}"
@@ -558,6 +601,137 @@ async def cmd_loan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await _render_loan_summary(update, settings, buckets, show_all=show_all, tag=tag)
+
+
+async def _cmd_loan_merge(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, args: list[str]
+) -> None:
+    """`/loan merge <from> <to>` — rewrite tags + persist alias.
+
+    Idempotent. Safe if <from> bucket is empty (just stores the alias for
+    future writes). Refuses to create loops (a→b when b already → a).
+    """
+    msg = update.effective_message
+    if len(args) < 2:
+        await msg.reply_markdown(
+            "Usage: `/loan merge <from> <to>`\n\n"
+            "Example: `/loan merge ikbal iqbal`\n"
+            "All existing `ikbal` entries get re-tagged as `iqbal`, and any "
+            "future entry the bot logs as `ikbal` will auto-collapse to `iqbal`.\n\n"
+            "See current aliases: `/loan aliases`"
+        )
+        return
+    src_input, dst_input = args[0], args[1]
+    aliases = get_loan_aliases(context)
+    owl = get_owl(context)
+
+    # Step 1: persist the alias (validates loops too).
+    src_s, dst_s, status = await aliases.add(src_input, dst_input)
+    if status == "rejected-self":
+        await msg.reply_text(f"❌ Can't merge a name into itself: {src_s}")
+        return
+    if status == "rejected-loop":
+        await msg.reply_text(
+            f"❌ That would create an alias loop ({dst_s} already chains back to {src_s})."
+        )
+        return
+    if status == "rejected-empty":
+        await msg.reply_text("❌ Names must be non-empty after normalization.")
+        return
+
+    # Step 2: rewrite existing loan--<src_s> tags to loan--<dst_s>.
+    # Touches every entry that has the source tag, even if it belongs to
+    # a different user — aliases are global because the dashboard view is
+    # global. Future per-user aliases would split this map by user_id.
+    try:
+        all_exp = await owl.list_all()
+    except ExpenseOwlError as exc:
+        await msg.reply_text(
+            f"⚠️ Alias saved ({src_s} → {dst_s}), but couldn't fetch existing "
+            f"entries to rewrite: {exc}"
+        )
+        return
+
+    src_tag = f"loan--{src_s}"
+    dst_tag = f"loan--{dst_s}"
+    affected = [
+        e for e in all_exp
+        if any(str(t) == src_tag for t in (e.get("tags") or []))
+    ]
+    rewritten = 0
+    failed = 0
+    for e in affected:
+        tags = list(e.get("tags") or [])
+        new_tags = [dst_tag if str(t) == src_tag else str(t) for t in tags]
+        eid = str(e.get("id") or "")
+        if not eid:
+            failed += 1
+            continue
+        try:
+            await owl.edit(
+                eid,
+                name=str(e.get("name") or ""),
+                amount=float(e.get("amount") or 0),
+                category=str(e.get("category") or "Other"),
+                date=str(e.get("date") or ""),
+                tags=new_tags,
+            )
+            rewritten += 1
+        except ExpenseOwlError as exc:
+            logger.warning("Failed to rewrite %s: %s", eid, exc)
+            failed += 1
+
+    parts = [
+        f"✅ Alias saved: `{src_s}` → `{dst_s}`",
+        f"Rewrote {rewritten} existing entr{'y' if rewritten == 1 else 'ies'}.",
+    ]
+    if failed:
+        parts.append(f"⚠️ {failed} entries failed to rewrite (see logs).")
+    if status == "updated":
+        parts.append("_(this replaced a previous alias)_")
+    parts.append("\nUndo with `/loan unmerge " + src_s + "`")
+    await msg.reply_markdown("\n".join(parts))
+
+
+async def _cmd_loan_unmerge(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, args: list[str]
+) -> None:
+    msg = update.effective_message
+    if not args:
+        await msg.reply_markdown(
+            "Usage: `/loan unmerge <name>`\n"
+            "Removes the alias so future entries with that name keep their own bucket. "
+            "Does NOT rewrite already-rewritten historical entries — you'd need to do "
+            "that manually if you want the old separation back."
+        )
+        return
+    aliases = get_loan_aliases(context)
+    src_s = args[0]
+    result = await aliases.remove(src_s)
+    if result == "not-found":
+        await msg.reply_text(f"No alias for '{src_s}'.")
+    else:
+        from ..services.loan_aliases import normalise_loan_slug
+        await msg.reply_text(f"↩️ Removed alias for '{normalise_loan_slug(src_s)}'.")
+
+
+async def _cmd_loan_aliases(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    msg = update.effective_message
+    aliases = get_loan_aliases(context)
+    m = aliases.all_aliases()
+    if not m:
+        await msg.reply_markdown(
+            "No loan aliases set.\n\n"
+            "Example: `/loan merge ikbal iqbal` collapses both into one bucket."
+        )
+        return
+    lines = ["*Current loan aliases:*"]
+    for src in sorted(m.keys()):
+        lines.append(f"• `{src}` → `{m[src]}`")
+    lines.append("\nRemove one with `/loan unmerge <name>`")
+    await msg.reply_markdown("\n".join(lines))
 
 
 async def _render_loan_summary(
@@ -751,6 +925,12 @@ async def _render_loan_detail(
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/report dispatcher:
+      /report              monthly cash-flow summary (default)
+      /report all          household scope (everyone's entries)
+      /report daily        day-by-day ledger (the old layout)
+      /report daily all    household daily ledger
+    """
     settings = get_settings(context)
     if not is_authorised(update, context):
         return
@@ -760,22 +940,262 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text(f"❌ {exc}")
         return
 
-    show_all = _wants_all_view(context)
+    args_lower = [a.strip().lower() for a in (getattr(context, "args", None) or [])]
+    show_all = "all" in args_lower
+    daily_view = "daily" in args_lower
+
     tag = user_tag(update, settings)
     own = (
         all_expenses if show_all
         else [e for e in all_expenses if expense_has_tag(e, tag)]
     )
-
     if not own:
         scope = "yet" if show_all else f"for {tag} yet"
         await update.effective_message.reply_text(f"Nothing logged {scope}.")
         return
 
-    month_entries = _filter_month(own)
+    if daily_view:
+        await _render_report_daily(update, settings, own, show_all=show_all, tag=tag)
+    else:
+        aliases = get_loan_aliases(context)
+        await _render_report_summary(
+            update, settings, own, show_all=show_all, tag=tag, aliases=aliases,
+        )
 
-    # Group month entries by local date so we can collapse each day
-    # into a single row.
+
+# ---- helpers used by the summary view ------------------------------------
+
+def _filter_prev_month(expenses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Entries dated in the LOCAL previous calendar month."""
+    now = datetime.now(TIMEZONE)
+    prev_y, prev_m = (now.year, now.month - 1) if now.month > 1 else (now.year - 1, 12)
+    out: list[dict[str, Any]] = []
+    for exp in expenses:
+        when = parse_expense_date(exp.get("date"))
+        if not when:
+            continue
+        local = when.astimezone(TIMEZONE)
+        if local.year == prev_y and local.month == prev_m:
+            out.append(exp)
+    return out
+
+
+def _days_in_month(now: datetime) -> int:
+    """Number of days in `now`'s local month."""
+    if now.month == 12:
+        nxt = now.replace(year=now.year + 1, month=1, day=1)
+    else:
+        nxt = now.replace(month=now.month + 1, day=1)
+    last = nxt - timedelta(days=1)
+    return last.day
+
+
+def _active_days(entries: list[dict[str, Any]]) -> int:
+    return len({_entry_local_date(e) for e in entries if _entry_local_date(e)})
+
+
+def _top_mover(
+    entries: list[dict[str, Any]],
+    *,
+    side: str,
+) -> tuple[str, float, Any] | None:
+    """Biggest single-entry mover on `side` ('out' = expense/loan-out, 'in' = income/loan-in).
+    Returns (name, magnitude, local_date) or None.
+    """
+    out_buckets = {"regular_expense", "loan_repaid", "loan_given"}
+    in_buckets = {"regular_income", "loan_taken", "loan_received"}
+    target = out_buckets if side == "out" else in_buckets
+    best: tuple[float, dict[str, Any]] | None = None
+    for e in entries:
+        bucket, mag = _classify_entry(e)
+        if bucket not in target or mag <= 0:
+            continue
+        if best is None or mag > best[0]:
+            best = (mag, e)
+    if best is None:
+        return None
+    mag, e = best
+    return (str(e.get("name") or "?"), mag, _entry_local_date(e))
+
+
+def _category_breakdown(
+    entries: list[dict[str, Any]],
+) -> list[tuple[str, float, float]]:
+    """List of (category, amount, pct) for regular expenses only, desc by amount."""
+    sums: dict[str, float] = defaultdict(float)
+    for e in entries:
+        bucket, mag = _classify_entry(e)
+        if bucket != "regular_expense":
+            continue
+        sums[str(e.get("category") or "Other")] += mag
+    total = sum(sums.values())
+    if total <= 0:
+        return []
+    return sorted(
+        ((cat, amt, amt / total * 100) for cat, amt in sums.items()),
+        key=lambda x: -x[1],
+    )
+
+
+def _net_loan_position(
+    own_all_time: list[dict[str, Any]],
+    *,
+    aliases,
+) -> tuple[float, float]:
+    """Return (you_owe_total, owed_to_you_total) summed across every loan
+    bucket. Uses the alias map so collapsed names sum into one bucket.
+    """
+    buckets = _build_loan_buckets(own_all_time, aliases=aliases)
+    you_owe = 0.0
+    owed_to_you = 0.0
+    for name, b in buckets.items():
+        net = (b["taken"] - b["repaid"]) - (b["given"] - b["received"])
+        if net > 0:
+            you_owe += net
+        elif net < 0:
+            owed_to_you += -net
+    return you_owe, owed_to_you
+
+
+# ---- /report summary view (default) --------------------------------------
+
+async def _render_report_summary(
+    update: Update,
+    settings,
+    own_all_time: list[dict[str, Any]],
+    *,
+    show_all: bool,
+    tag: str,
+    aliases,
+) -> None:
+    cur = settings.currency_symbol
+    now = datetime.now(TIMEZONE)
+    scope_name = "everyone" if show_all else tag
+
+    month_entries = _filter_month(own_all_time)
+    prev_entries = _filter_prev_month(own_all_time)
+    month = _sum_buckets(month_entries)
+    prev = _sum_buckets(prev_entries)
+
+    # Cash flow components.
+    loans_in = month["loan_taken"] + month["loan_received"]
+    loans_out = month["loan_repaid"] + month["loan_given"]
+    reg_in = month["regular_income"]
+    reg_out = month["regular_expense"]
+    net_change = (reg_in + loans_in) - (reg_out + loans_out)
+    net_worth_change = reg_in - reg_out  # excludes loan churn
+
+    # Pace.
+    days_elapsed = now.day
+    days_total = _days_in_month(now)
+    active = _active_days(month_entries)
+    eom_forecast = (
+        reg_out * days_total / days_elapsed if days_elapsed > 0 and reg_out > 0
+        else 0.0
+    )
+    prev_reg_out = prev["regular_expense"]
+
+    # Net loan position from ALL time, not just this month.
+    you_owe, owed_to_you = _net_loan_position(own_all_time, aliases=aliases)
+
+    # ---- layout ----
+    lines: list[str] = [
+        f"{now.strftime('%B %Y').upper()} · {scope_name} · as of "
+        f"{now.strftime('%d/%m %H:%M')}",
+        "",
+    ]
+
+    # CASH FLOW block
+    lines.append("CASH FLOW")
+    lines.append(_loan_pair("Regular income",  _money_signed(+reg_in,  cur)))
+    lines.append(_loan_pair("Loans IN",        _money_signed(+loans_in, cur)))
+    lines.append(_loan_pair("Regular expense", _money_signed(-reg_out, cur)))
+    lines.append(_loan_pair("Loans OUT",       _money_signed(-loans_out, cur)))
+    lines.append("  " + "─" * (_LOAN_W - 2))
+    lines.append(_loan_pair("Net change",      _money_signed(net_change, cur)))
+    lines.append("")
+    lines.append(_loan_pair("Net worth change (excl loans)", _money_signed(net_worth_change, cur)))
+    if you_owe:
+        lines.append(_loan_pair("Outstanding (you owe)",  _format_money(you_owe, cur)))
+    if owed_to_you:
+        lines.append(_loan_pair("Outstanding (owed to you)", _format_money(owed_to_you, cur)))
+
+    # PACE block
+    lines.append("")
+    lines.append("PACE")
+    lines.append(_loan_pair("Active days", f"{active} of {days_elapsed} elapsed"))
+    if eom_forecast:
+        lines.append(_loan_pair("EOM expense forecast", f"~{_format_money(eom_forecast, cur)}"))
+    if prev_reg_out:
+        delta_pct = (reg_out - prev_reg_out) / prev_reg_out * 100
+        arrow = "▲" if delta_pct >= 0 else "▼"
+        lines.append(_loan_pair(
+            "Last month expense",
+            f"{_format_money(prev_reg_out, cur)} {arrow} {abs(delta_pct):.0f}%",
+        ))
+    elif prev_entries:
+        lines.append(_loan_pair("Last month expense", "—"))
+
+    # TOP MOVERS block
+    top_out = _top_mover(month_entries, side="out")
+    top_in = _top_mover(month_entries, side="in")
+    if top_out or top_in:
+        lines.append("")
+        lines.append("TOP MOVERS")
+        if top_out:
+            name, mag, d = top_out
+            dt = d.strftime("%d/%m") if d else "?"
+            lines.append(_loan_pair("Biggest spend",
+                                    f"{_truncate(name, 18)} {_format_money(mag, cur)} ({dt})"))
+        if top_in:
+            name, mag, d = top_in
+            dt = d.strftime("%d/%m") if d else "?"
+            lines.append(_loan_pair("Biggest income",
+                                    f"{_truncate(name, 18)} {_format_money(mag, cur)} ({dt})"))
+
+    # CATEGORIES block (expenses only)
+    cats = _category_breakdown(month_entries)
+    if cats:
+        lines.append("")
+        lines.append("CATEGORIES (regular expense)")
+        for cat, amt, pct in cats:
+            lines.append(_loan_pair(
+                f"  {cat}",
+                f"{_format_money(amt, cur)} ({pct:.0f}%)",
+            ))
+
+    lines.append("")
+    lines.append("─" * _LOAN_W)
+    lines.append("/report daily   day-by-day ledger")
+    lines.append("/loan           per-counterparty detail")
+
+    body = "\n".join(lines).rstrip()
+    await update.effective_message.reply_html(f"<pre>{html.escape(body)}</pre>")
+
+
+def _money_signed(amount: float, currency: str) -> str:
+    """Like _format_money but always shows sign; '—' for zero."""
+    if abs(amount) < 0.5:
+        return "—"
+    sign = "+" if amount > 0 else "-"
+    return f"{sign}{_format_money(amount, currency)}"
+
+
+# ---- /report daily view (the old layout, now opt-in) ---------------------
+
+async def _render_report_daily(
+    update: Update,
+    settings,
+    own_all_time: list[dict[str, Any]],
+    *,
+    show_all: bool,
+    tag: str,
+) -> None:
+    """The previous default — day-by-day rolled-up ledger. Kept available
+    via `/report daily` for months where day-level detail matters."""
+    cur = settings.currency_symbol
+    month_entries = _filter_month(own_all_time)
+
     by_date: dict[Any, list[dict[str, Any]]] = defaultdict(list)
     for e in month_entries:
         d = _entry_local_date(e)
@@ -785,51 +1205,31 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     daily = [_daily_row(d, by_date[d]) for d in sorted(by_date.keys())]
     total_out = sum(r["out"] for r in daily)
     total_in = sum(r["in"] for r in daily)
-
     now = datetime.now(TIMEZONE)
     scope_name = "everyone" if show_all else tag
-    cur = settings.currency_symbol
 
     body_lines: list[str] = [
-        f"{now.strftime('%B %Y')} · {scope_name}",
+        f"{now.strftime('%B %Y')} · {scope_name} · daily",
         "",
         _table_line("Date", "Item", "Out", "In"),
         "─" * _REPORT_W,
     ]
     if daily:
         for r in daily:
-            body_lines.append(
-                _table_line(r["date"], r["item"], _cell_amount(r["out"]), _cell_amount(r["in"]))
-            )
+            body_lines.append(_table_line(
+                r["date"], r["item"],
+                _cell_amount(r["out"]), _cell_amount(r["in"]),
+            ))
         body_lines.append("─" * _REPORT_W)
-        body_lines.append(
-            _table_line("TOTAL", "", _cell_amount(total_out), _cell_amount(total_in))
-        )
+        body_lines.append(_table_line(
+            "TOTAL", "", _cell_amount(total_out), _cell_amount(total_in),
+        ))
     else:
-        body_lines.append("  (no entries yet)")
-
-    # Below the table: loans + outstanding + net so the user can read
-    # the "what's happening with loans" story without re-summing rows.
-    month_buckets = _sum_buckets(month_entries)
-    life = _sum_buckets(own)
-    outstanding = life["loan_taken"] - life["loan_repaid"]
-    month_net = total_in - total_out
+        body_lines.append("  (no entries this month)")
 
     body_lines.append("")
-    body_lines.append(f"amounts in {cur}")
-    sign = "+" if month_net >= 0 else "−"
-    body_lines.append(f"Net this month: {sign}{cur}{abs(int(month_net)):,}")
-    if month_buckets["loan_taken"] or month_buckets["loan_repaid"]:
-        body_lines.append(
-            f"Loans this month: in {cur}{int(month_buckets['loan_taken']):,} · "
-            f"out {cur}{int(month_buckets['loan_repaid']):,}"
-        )
-    if outstanding:
-        body_lines.append(f"Outstanding loan: {cur}{int(outstanding):,}")
-
+    body_lines.append("/report   for the cash-flow summary")
     body = "\n".join(body_lines)
-    # <pre> renders monospace on Telegram so the columns line up.
-    # Escape because tag values could contain <, >, & in pathological cases.
     await update.effective_message.reply_html(f"<pre>{html.escape(body)}</pre>")
 
 

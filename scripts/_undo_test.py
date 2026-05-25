@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from bot.config import load_settings
 from bot.services.allowlist import Allowlist
 from bot.services.expenseowl import ExpenseOwl
+from bot.services.loan_aliases import LoanAliases
 from bot.services import parser as parser_service
 from bot.handlers.commands import cmd_undo
 
@@ -60,10 +61,12 @@ async def run():
 
     print()
     print("STEP 3: call /undo as Saiful")
+    loan_aliases = LoanAliases(json_path=Path("/app/data/loan_aliases.json"))
     application = SimpleNamespace(bot_data={
         "settings": settings,
         "owl": owl,
         "allowlist": allowlist,
+        "loan_aliases": loan_aliases,
         "last_expense_id": {},
     })
     msg = CapturedMessage()

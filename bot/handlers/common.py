@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 from ..config import TIMEZONE, Settings
 from ..services.allowlist import Allowlist
 from ..services.expenseowl import ExpenseOwl, ExpenseOwlError
+from ..services.loan_aliases import LoanAliases
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,10 @@ def get_owl(context: ContextTypes.DEFAULT_TYPE) -> ExpenseOwl:
 
 def get_allowlist(context: ContextTypes.DEFAULT_TYPE) -> Allowlist:
     return context.application.bot_data["allowlist"]
+
+
+def get_loan_aliases(context: ContextTypes.DEFAULT_TYPE) -> LoanAliases:
+    return context.application.bot_data["loan_aliases"]
 
 
 def is_authorised(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -210,6 +215,11 @@ async def log_entries(
         elif flow == "loan_received_back":
             flow_tag = "loan-received"
         loan_name = (entry.get("loan_name") or "").strip()
+        # Collapse Whisper mistranscriptions / synonyms to their canonical
+        # form before writing the tag. The alias map is managed from
+        # Telegram via /loan merge; see services/loan_aliases.py.
+        if loan_name:
+            loan_name = get_loan_aliases(context).canonical(loan_name)
         # ExpenseOwl strips ':' and '|' from tags (replaces with space).
         # Hyphen survives, so encode the loan name as `loan--<slug>` and
         # let cmd_loan parse it back. See _loan_name_from_tags.

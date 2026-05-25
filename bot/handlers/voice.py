@@ -55,6 +55,23 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         mime_lower or "unknown", len(audio_bytes),
     )
 
+    # Tiny-audio guard. Telegram OGG voice notes are ~3-6 KB/sec. Anything
+    # under ~6 KB is a tap-and-release (sub-second) clip — too short to
+    # carry a real entry. Send it to Gemini and it'll hallucinate from
+    # the SYSTEM_PROMPT examples ("uber 280", "lunch 350"). Reject up
+    # front instead.
+    MIN_AUDIO_BYTES = 6 * 1024
+    if len(audio_bytes) < MIN_AUDIO_BYTES:
+        logger.info(
+            "Rejecting tiny voice note (%d bytes < %d threshold) — would hallucinate",
+            len(audio_bytes), MIN_AUDIO_BYTES,
+        )
+        await status.edit_text(
+            "🤏 That voice note's too short to hear anything in. "
+            "Hold the mic for at least a second and try again."
+        )
+        return
+
     if settings.use_audio_native_gemini:
         await status.edit_text("🎧 Listening… 🤖 thinking…")
         try:

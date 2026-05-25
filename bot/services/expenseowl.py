@@ -102,6 +102,44 @@ class ExpenseOwl:
             raise ExpenseOwlError(f"Unexpected ExpenseOwl payload: {str(data)[:200]}")
         return data
 
+    async def edit(
+        self,
+        expense_id: str,
+        *,
+        name: str,
+        amount: float,
+        category: str,
+        date: str,
+        tags: list[str],
+    ) -> None:
+        """Overwrite an existing expense by id. ExpenseOwl's edit endpoint
+        replaces the whole record — pass back every field even if only tags
+        are changing. `date` should be the ISO-8601 string already on the row.
+        """
+        url = f"{self.base_url}/expense/edit"
+        payload = {
+            "name": name,
+            "amount": float(amount),
+            "category": category,
+            "date": date,
+            "tags": list(tags),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.put(
+                    url,
+                    params={"id": expense_id},
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+        except httpx.HTTPError as exc:
+            raise ExpenseOwlError(f"Could not reach ExpenseOwl at {url}: {exc}") from exc
+        if response.status_code >= 300:
+            raise ExpenseOwlError(
+                f"ExpenseOwl PUT /expense/edit failed ({response.status_code}): "
+                f"{response.text[:300]}"
+            )
+
     async def delete(self, expense_id: str) -> None:
         url = f"{self.base_url}/expense/delete"
         try:

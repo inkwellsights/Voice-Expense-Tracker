@@ -45,6 +45,7 @@ from .handlers.text import handle_text
 from .handlers.voice import handle_voice
 from .services.allowlist import Allowlist
 from .services.expenseowl import ExpenseOwl
+from .services.loan_aliases import LoanAliases
 from .services import parser as parser_service
 
 # Where the dynamic-allowlist JSON lives. Inside Docker we mount /app/data
@@ -92,6 +93,9 @@ def build_application() -> Application:
     application.bot_data["allowlist"] = Allowlist(
         static_ids=set(settings.allowed_user_ids),
         json_path=DATA_DIR / "allowed_users.json",
+    )
+    application.bot_data["loan_aliases"] = LoanAliases(
+        json_path=DATA_DIR / "loan_aliases.json",
     )
 
     application.add_handler(CommandHandler("start", cmd_start))

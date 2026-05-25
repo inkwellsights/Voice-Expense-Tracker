@@ -52,6 +52,12 @@ _GROQ_LLM_MODEL: str = ""
 GROQ_LLM_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 SYSTEM_PROMPT = f"""You are a cash-flow parser. Extract money-movement entries from the user's input (which may be text, a speech-to-text transcript, or raw audio).
+
+CRITICAL — READ FIRST:
+- If the input has no clear numeric amount, is silent audio, is gibberish, is a Whisper hallucination (single line like "Thanks for watching", "Subtitles by..."), or you genuinely cannot understand it, return EXACTLY: []
+- NEVER invent entries by copying from the examples below. The examples teach the JSON FORMAT and category mapping; the amounts and item names in them are NOT real data and must not appear in your output unless they are actually present in THIS input.
+- If you would have to guess a number to produce any entry, return [] instead.
+
 Input may be English, Bengali (Bangla), or Banglish (mixed). Transcripts may have spelling errors.
 
 Each entry has a TYPE — either "expense" (money out) or "income" (money in).
