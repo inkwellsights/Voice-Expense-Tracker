@@ -38,12 +38,21 @@ def is_authorised(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     Consults the dynamic allowlist (env-static + runtime-dynamic via /allow).
     If the combined allowlist is empty, the bot is open to anyone (useful
     for first-run setup).
+    Denials are logged so silent drops don't leave debugging in the dark.
     """
     allowlist = get_allowlist(context)
     if allowlist.is_open():
         return True
     user = update.effective_user
-    return bool(user and user.id in allowlist)
+    ok = bool(user and user.id in allowlist)
+    if not ok:
+        logger.info(
+            "AUTH_DENIED user=%s(%s) — not on allowlist. Use /allow %s to admit.",
+            getattr(user, "first_name", "?"),
+            getattr(user, "id", "?"),
+            getattr(user, "id", "?"),
+        )
+    return ok
 
 
 def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -108,20 +117,25 @@ def format_confirmation(
     currency: str,
     *,
     default_context: str = "personal",
+    heard: str = "",
 ) -> str:
     # Bot logs everything in real-time, so a single header date+time applies
     # to the whole batch. Asia/Dhaka local time, matches the timestamps the
     # entries get stored with.
     stamp = datetime.now(TIMEZONE).strftime("%Y-%m-%d · %H:%M")
     lines = [f"✅ Logged · {stamp}"]
+    if heard:
+        # Surface what the bot understood from voice so mishears
+        # ("rickshaw vara" → "discover") are immediately visible.
+        lines.append(f"🎤 heard: \"{heard}\"")
     exp_total = 0.0
     inc_total = 0.0
     for entry in entries:
         kind = entry.get("type", "expense")
         amt = float(entry["amount"])
-        # Suffix surfaces context tag (when non-default) and loan flow
-        # (with name when known) so the user can verify the bot
-        # understood. Stays terse.
+        # Suffix surfaces context tag (when non-default), loan flow (with
+        # name when known), and any FX conversion so the user can verify
+        # the bot understood. Stays terse.
         ctx = (entry.get("context") or "").strip()
         flow = (entry.get("flow") or "regular").strip().lower()
         loan_name = (entry.get("loan_name") or "").strip()
@@ -136,6 +150,9 @@ def format_confirmation(
             suffix_parts.append(f"lent ({loan_name})" if loan_name else "lent")
         elif flow == "loan_received_back":
             suffix_parts.append(f"got back ({loan_name})" if loan_name else "got back")
+        fx = (entry.get("_fx") or "").strip()
+        if fx:
+            suffix_parts.append(fx)
         suffix = (" · " + " · ".join(suffix_parts)) if suffix_parts else ""
         if kind == "income":
             inc_total += amt
@@ -167,15 +184,45 @@ async def log_entries(
     context: ContextTypes.DEFAULT_TYPE,
     entries: list[dict[str, Any]],
     status_message=None,
+    *,
+    heard: str = "",
 ) -> None:
     """Send entries to ExpenseOwl and reply to the user.
 
     If `status_message` is provided, edits it in place rather than sending a
     new reply — used by the voice handler to show a single status bubble that
     transitions from "🎧 Listening…" to the final confirmation.
+
+    `heard` is the literal phrase the voice-stage produced (Gemini audio-native
+    or Whisper transcript). When non-empty it's surfaced in the confirmation
+    so the user can spot mishears immediately.
     """
     settings = get_settings(context)
     owl = get_owl(context)
+
+    # FX conversion: parser may emit a non-default `currency` (e.g. "USD").
+    # Convert to the bot's base currency (BDT) using settings.currency_rates,
+    # storing the converted amount in ExpenseOwl but attaching `_fx` so the
+    # confirmation can show the original "($100 → ৳12,000 @120)".
+    base_currency = (settings.currency_symbol or "৳").strip()
+    for entry in entries:
+        cur_code = str(entry.get("currency") or "BDT").strip().upper()
+        if cur_code in ("", "BDT", "TAKA", "TK"):
+            continue
+        rate = settings.currency_rates.get(cur_code)
+        if not rate or rate <= 0:
+            logger.warning(
+                "No rate for currency %s — storing as-is, user should check.",
+                cur_code,
+            )
+            continue
+        original_amt = float(entry["amount"])
+        converted = round(original_amt * rate, 2)
+        entry["_fx"] = (
+            f"{cur_code} {int(original_amt):,} → {base_currency}"
+            f"{int(converted):,} @{rate:g}"
+        )
+        entry["amount"] = converted
 
     async def respond(text: str) -> None:
         if status_message is not None:
@@ -252,5 +299,6 @@ async def log_entries(
             logged,
             settings.currency_symbol,
             default_context=settings.context_default,
+            heard=heard,
         )
     )

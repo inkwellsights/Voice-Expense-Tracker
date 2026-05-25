@@ -76,6 +76,12 @@ class Settings:
     # are never deleted — they remain in ExpenseOwl, /report, dashboard,
     # and the /loan <name> deep-dive.
     settled_loan_visible_days: int = 30
+    # FX conversion rates for non-BDT entries. Parser may emit a `currency`
+    # field (USD, EUR, AED, etc.); log_entries multiplies by the rate here
+    # to store the amount in the base currency (taka). Confirmation shows
+    # the original amount + rate. Update rates via env, no code change.
+    # Example: CURRENCY_RATES=USD:122,EUR:131,GBP:155,AED:33,INR:1.45,SAR:32
+    currency_rates: dict[str, float] = field(default_factory=dict)
 
 
 def _require(name: str) -> str:
@@ -149,6 +155,34 @@ def _parse_bool(raw: str | None, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _parse_currency_rates() -> dict[str, float]:
+    """Parse CURRENCY_RATES env into {CODE: rate_in_BDT_per_unit}.
+
+    Format: USD:122,EUR:131,GBP:155 (codes case-insensitive, normalised to upper).
+    Malformed entries are skipped with a warning rather than crashing startup.
+    """
+    raw = os.getenv("CURRENCY_RATES", "").strip()
+    if not raw:
+        return {}
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    out: dict[str, float] = {}
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        code, rate_s = chunk.split(":", 1)
+        code = code.strip().upper()
+        try:
+            rate = float(rate_s.strip())
+            if rate <= 0:
+                raise ValueError("non-positive rate")
+            out[code] = rate
+        except ValueError as exc:
+            log.warning("Skipping malformed CURRENCY_RATES entry %r: %s", chunk, exc)
+    return out
+
+
 def _parse_context_synonyms() -> dict[str, list[str]]:
     """Parse TAG_SYNONYMS into {canonical: [synonym1, synonym2, ...]}.
 
@@ -217,4 +251,5 @@ def load_settings() -> Settings:
         settled_loan_visible_days=int(
             os.getenv("SETTLED_LOAN_VISIBLE_DAYS", "30") or 30
         ),
+        currency_rates=_parse_currency_rates(),
     )

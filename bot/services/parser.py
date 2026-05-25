@@ -85,10 +85,19 @@ Be tolerant of Whisper mistranscriptions:
 - "do is show"/"dui show"/"doish" = duisho = 200
 - "shura ka"/"shuruka" = taka
 - "bargar"=burger, "raisten"=rice
+- "discover"/"discovery"/"diskover" likely = "rickshaw" (Banglish ASR mishears the soft "r" + "iksh" cluster)
+- "vara"/"bhara"/"bara" = fare (transport bhara is the fare for a vehicle)
+- "rickshaw vara"/"rickshaw bhara"/"riksha vara"/"discover vara" = rickshaw fare → name "rickshaw", category Transport
+- "CNG vara"/"CNG bhara" = autorickshaw fare → name "CNG", category Transport
+- "bus vara"/"bus bhara" = bus fare → category Transport
+- "khabar"/"khabaar" = food/meal → category Food
+- "duchin" / "dokan"/"dukan" = shop → context-dependent
+- "khancha"/"khaicha" / "khaisi" = ate / spent on food → category Food
 
 Return ONLY a JSON array, no other text. Each entry MUST have:
 - "name": short description ("lunch", "uber", "groceries", "salary", "gift received")
-- "amount": positive integer, no currency symbols, no decimals unless explicit
+- "amount": positive integer, no decimals unless explicit
+- "currency": ISO 4217 code if a non-default currency was clearly indicated. The default is "BDT" (Bangladeshi taka — leave the field out or set to "BDT" for plain taka). Detect: "$" or "dollars" / "USD" → "USD"; "€" or "euros" / "EUR" → "EUR"; "£" or "pounds" / "GBP" → "GBP"; "AED" or "dirhams" → "AED"; "INR" / "rupees" / "Rs" → "INR"; "SAR" / "riyals" → "SAR". The bot converts to taka downstream using configurable rates — emit the amount in the SOURCE currency, NOT pre-converted.
 - "category": one of {CATEGORIES}
 - "type": "expense" or "income"
 - "context": short lowercase bucket the money belongs to. If the speaker mentions a specific company, project, person, fund, or label, extract it as a short lowercase string (e.g. "masnoonhub", "wedding fund", "office"). Otherwise omit the field — the bot will default it.
@@ -179,10 +188,18 @@ AUDIO_PROMPT = (
     "expense (money out) or income (money in) based on the verbs used.\n\n"
     "CRITICAL: If the audio is silent, contains no speech, contains speech "
     "but no clear numeric amount, or you cannot confidently understand the "
-    "speaker, return an empty array []. Do NOT invent entries based on the "
+    "speaker, return entries: []. Do NOT invent entries based on the "
     "examples in the system instructions — those are reference patterns, "
     "not content to copy. Only emit entries you can hear in THIS audio.\n\n"
-    "Return ONLY the JSON array."
+    "Return a JSON OBJECT (not a bare array) with this exact shape:\n"
+    "{\n"
+    "  \"heard\": \"the literal phrase you heard, in Banglish transliteration if non-English\",\n"
+    "  \"entries\": [ ...entries following the schema in the system instructions... ]\n"
+    "}\n"
+    "The `heard` field is shown to the user verbatim so they can verify the "
+    "transcription was correct — be FAITHFUL to what was actually said, "
+    "including any uncertainty (use [unclear] markers if part of the audio "
+    "was muffled). Keep `heard` under 200 characters."
 )
 
 
@@ -209,6 +226,41 @@ def _extract_json_array(raw: str) -> list[dict[str, Any]]:
     if not isinstance(parsed, list):
         raise ParseError(f"Gemini did not return a JSON array: {raw[:300]}")
     return parsed
+
+
+def _extract_heard_object(raw: str) -> tuple[str, list[dict[str, Any]]]:
+    """Pull `{heard, entries}` from an audio response. Tolerates fences and
+    objects-without-heard (treats the whole thing as entries with heard="").
+    """
+    text = raw.strip()
+    fenced = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+    # Try to parse as object first.
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # Fallback: maybe the model returned a bare array (older schema).
+        # Find first [...] and use it as entries with empty heard.
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if not match:
+            raise ParseError(f"Audio response not JSON: {raw[:300]}")
+        try:
+            arr = json.loads(match.group(0))
+        except json.JSONDecodeError as exc:
+            raise ParseError(f"Audio response not JSON: {raw[:300]}") from exc
+        if not isinstance(arr, list):
+            raise ParseError(f"Audio response not an array: {raw[:300]}")
+        return "", arr
+    if isinstance(parsed, list):
+        return "", parsed
+    if not isinstance(parsed, dict):
+        raise ParseError(f"Audio response not object or array: {raw[:300]}")
+    heard = str(parsed.get("heard") or "").strip()
+    entries = parsed.get("entries")
+    if not isinstance(entries, list):
+        raise ParseError(f"Audio response missing 'entries' array: {raw[:300]}")
+    return heard, entries
 
 
 def configure_cascade(
@@ -339,6 +391,12 @@ def _validate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         # lowercase ascii-ish slug so two phrasings of the same name
         # ("Rahim", "rahim ") collapse to one bucket.
         loan_name = _normalize_loan_name(entry.get("loan_name")) if flow_raw != "regular" else ""
+        # Currency code — optional, defaults to BDT. Anything Gemini
+        # emits is normalised to uppercase 3-letter ISO code; if it's
+        # unknown, the FX layer downstream will log and store as-is.
+        currency_raw = str(entry.get("currency") or "BDT").strip().upper()
+        if not currency_raw or len(currency_raw) > 6:
+            currency_raw = "BDT"
         cleaned.append(
             {
                 "name": name,
@@ -348,6 +406,7 @@ def _validate(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "context": context,
                 "flow": flow_raw,
                 "loan_name": loan_name,
+                "currency": currency_raw,
             }
         )
     return cleaned
@@ -596,8 +655,13 @@ async def parse_image(image_bytes: bytes, mime_type: str, *, api_key: str) -> li
 
 async def parse_audio(
     audio_bytes: bytes, mime_type: str, *, api_key: str
-) -> list[dict[str, Any]]:
+) -> tuple[str, list[dict[str, Any]]]:
     """Parse expenses (and income) directly from a voice note.
+
+    Returns (heard_phrase, entries). `heard_phrase` is Gemini's best
+    transcription of what was actually said — surfaced to the user in the
+    confirmation so mishears (e.g. "rickshaw vara" → "discover") are
+    catchable. Empty string if Gemini didn't emit one.
 
     Skips Whisper — Gemini's multimodal models accept audio inline. One API
     call replaces the Whisper+Gemini-text pair, and Gemini reasons over the
@@ -609,4 +673,5 @@ async def parse_audio(
         {"text": AUDIO_PROMPT},
     ]
     raw = await _call_gemini(parts, api_key=api_key)
-    return _validate(_extract_json_array(raw))
+    heard, entries = _extract_heard_object(raw)
+    return heard, _validate(entries)

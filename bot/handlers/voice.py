@@ -75,10 +75,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if settings.use_audio_native_gemini:
         await status.edit_text("🎧 Listening… 🤖 thinking…")
         try:
-            entries = await parse_audio(
+            heard, entries = await parse_audio(
                 audio_bytes, gemini_mime, api_key=settings.gemini_api_key
             )
-            await log_entries(update, context, entries, status_message=status)
+            if heard:
+                logger.info("VOICE_HEARD (gemini) user=%s: %r",
+                            getattr(user, "first_name", "?"), heard)
+            await log_entries(
+                update, context, entries,
+                status_message=status, heard=heard,
+            )
             return
         except ParseError as exc:
             logger.warning("Audio-native Gemini failed (%s), falling back to Whisper", exc)
@@ -109,4 +115,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await status.edit_text(f"❌ Parser error: {exc}")
         return
 
-    await log_entries(update, context, entries, status_message=status)
+    # Whisper's transcript IS the "heard" text for the fallback path —
+    # plumb it the same way as Gemini audio-native so the user always sees
+    # what the bot understood, regardless of which voice tier ran.
+    await log_entries(
+        update, context, entries,
+        status_message=status, heard=transcript,
+    )
